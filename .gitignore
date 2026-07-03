@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Local model cache (optional offline mode)
+local_models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs
+*.log
