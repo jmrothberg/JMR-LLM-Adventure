@@ -273,7 +273,7 @@
   <!-- ═══ Loading overlay / Adventure picker ═══ -->
   <div id="loading-overlay">
     <h2 id="load-title">JMR's LLM Adventure</h2>
-    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0"></p>
+    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0">v1.1.5</p>
     <p>A fully LLM-driven text adventure running entirely in your browser.
        Gemma 4B generates the story; Stable Diffusion 1.5 paints the scenes.</p>
     <p style="font-size:0.8rem;color:var(--text-muted)">
@@ -333,7 +333,7 @@
   <header>
     <div>
       <h1>JMR's LLM Adventure</h1>
-      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 — all in browser</div>
+      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 — all in browser | v1.1.5</div>
     </div>
     <div class="header-actions">
       <button id="btn-save" title="Save world bible and current progress to this browser (localStorage)">Save game</button>
@@ -384,11 +384,14 @@
     import { pipeline, TextStreamer, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.1/+esm";
     import { Txt2ImgWorkerClient } from "../vendor/web-txt2img/index.js";
     import {
-      validateWorldBible, validateWorldBibleSolvability, autoRepairWorldBible,
+      validateWorldBible, validateWorldBibleSolvability, validateWorldBibleCoherence,
+      autoRepairWorldBible, repairWorldBibleCoherence, deriveMonsterWeaknessItems,
       extractFirstJson, extractMapSkeleton, extractJsonFromText, scoreChainCandidate,
       synthesizeAuthorWalkthrough, winConditionText, cloneWorldBible,
       forceSyntheticChainHardFloor, hasChainSolvabilityGaps,
       snapRoomToBible, snapItemToBible, roomsMatch, mergeRoomAlias,
+      computeChainProgress, simulateChainPlaythrough, reachableRoomsAtStep,
+      truncateAtWordBoundary, pickSdStylePhrase,
     } from "./world_bible_logic.mjs";
     import { runWorldBibleTests, formatTestResults } from "./world_bible_tests.mjs";
 
@@ -401,7 +404,18 @@
     // CONFIGURATION
     // ═══════════════════════════════════════════════════════════════════════════
     /** Bump when shipping UI/engine changes — visible on load screen + header. */
-    const GAME_VERSION = "1.1.2";
+    const GAME_VERSION = "1.1.5";
+
+    /** Version on load screen and in-game header — run early so it shows even if later init fails. */
+    function applyGameVersionLabels() {
+      const label = `v${GAME_VERSION}`;
+      const loadVer = document.getElementById("load-version");
+      if (loadVer) loadVer.textContent = label;
+      const gameVer = document.getElementById("game-version");
+      if (gameVer) gameVer.textContent = `Gemma 4B + SD 1.5 — all in browser | ${label}`;
+    }
+    applyGameVersionLabels();
+
     const LLM_MODEL_ID = "onnx-community/gemma-4-E4B-it-ONNX";
     const IMG_MODEL_ID = "sd-1.5";
     const LLM_MAX_TOKENS = 512;
@@ -439,6 +453,9 @@
     const USE_ATOMIC_PASS2 = true;
     const IMG_STEPS = 20;
     const IMG_GUIDANCE = 7.5;
+    // SD 1.5 + Gemma on the same WebGPU device can hang forever; WASM for SD avoids that.
+    const IMG_GENERATION_TIMEOUT_MS = 120000;
+    const IMG_DEFER_AFTER_LLM_MS = 750;
     const IMAGE_THEME = "Dark fantasy cave with glowing crystals, ancient stone architecture, misty atmosphere";
 
     // SD 1.5 rules (simple model, ~77 CLIP tokens): few concrete subjects, one composition hint, no contradictions.
@@ -630,6 +647,19 @@
 
     // Active world bible — swapped when generating or loading a different adventure
     let activeWorldBible = DEFAULT_WORLD_BIBLE;
+    /** Derived gating cues from chain simulator — not saved; recomputed on seed/load/import. */
+    let activeGating = { lockedRooms: new Set(), unlockStepByRoom: new Map() };
+
+    function recomputeActiveGating(wb) {
+      if (!wb) {
+        activeGating = { lockedRooms: new Set(), unlockStepByRoom: new Map() };
+        return;
+      }
+      const sim = simulateChainPlaythrough(wb);
+      activeGating = sim.ok
+        ? { lockedRooms: sim.lockedRooms, unlockStepByRoom: sim.unlockStepByRoom }
+        : { lockedRooms: new Set(), unlockStepByRoom: new Map() };
+    }
 
     // LLM-debug: world provenance + generation step log (shown in Debug panel before Turn 0).
     let lastWorldBibleSource = "default_builtin";
@@ -731,6 +761,7 @@
       "  change_health:N - damage(-) or heal(+)\n" +
       '  set_context:"summary" - YOUR MEMORY of what happened\n' +
       '  set_flag:{"name":"x","value":true} - track puzzle states\n' +
+      '  complete_step:N - report puzzle step N finished\n' +
       '  add_note:"text" - quest log entry\n' +
       '  images:["this room only, 6 words max"] - no other room names; engine adds items/NPCs for SD\n\n' +
 
@@ -750,6 +781,8 @@
       "- Update set_context every turn\n" +
       "- When a room blocker is cleared (door unlocked, guard fled, etc.): set_flag {\"name\":\"ROOM_unblocked\",\"value\":true} (ROOM = room name with spaces replaced by underscores)\n" +
       "- When a monster is defeated or flees: set_flag {\"name\":\"MONSTER_defeated\",\"value\":true} (MONSTER = monster name with spaces replaced by underscores)\n" +
+      "- complete_step:N — report puzzle step N finished (use the current_goal step number)\n" +
+      "- If a destination is listed as locked, narrate why and steer the player toward the current_goal instead.\n" +
       "- Use double quotes, no trailing commas in JSON\n" +
       "- META HELP: If the user message includes FULL_WORLD_BIBLE_JSON, they are asking for out-of-character help (goals, strategy, reminders). Use that JSON accurately but answer in natural language. Judge how much to say: a light nudge vs a clearer plan—your discretion. Do not dump the raw JSON unless they explicitly ask for it. For normal in-room actions, that section is omitted—stay in character.\n";
 
@@ -776,6 +809,7 @@
         gameFlags: {},
         roomsWithImages: [],                     // rooms that have cached scene images
         roomImageBlobs: {},                      // room -> blob URL (in-memory cache)
+        chainStepsDone: [],                      // explicit puzzle-chain steps completed via complete_step
       };
     }
 
@@ -1157,19 +1191,20 @@
       const itemNames = (wb.key_items || []).map(k => k && k.name).filter(Boolean);
       const roomNames = (wb.locations || []).map(l => l && l.name).filter(Boolean);
 
-      // 1. Monster weaknesses that don't reference any real key_item.
+      // 1. Monsters lacking weakness_item (combat cues need a concrete item).
       if (itemNames.length) {
         for (const mon of (wb.monsters || [])) {
-          if (!mon || typeof mon !== "object") continue;
+          if (!mon || typeof mon !== "object" || mon.weakness_item) continue;
           const w = String(mon.weakness || "").toLowerCase();
           const refsItem = itemNames.some(n => w.includes(n.toLowerCase()));
           if (refsItem) continue;
-          slog(`micro-repair: monster '${mon.name}' weakness doesn't reference any key_item — asking Gemma`);
+          slog(`micro-repair: monster '${mon.name}' has no weakness_item — asking Gemma`);
           const pick = await askOneChoice(
             `Which item is the weakness of "${mon.name}"? (Current weakness text: "${mon.weakness || ""}".)`,
             itemNames, runGen);
           if (pick) {
             mon.weakness = `${mon.weakness ? mon.weakness + " — " : ""}use the ${pick}`;
+            mon.weakness_item = pick;
             fixes.push(`monster '${mon.name}' weakness now references key_item '${pick}'`);
           } else {
             slog(`micro-repair: no choice for monster '${mon.name}'`);
@@ -1182,6 +1217,7 @@
       if (itemNames.length) {
         for (const step of (wb.puzzle_chain || [])) {
           if (!step || step.gives) continue;
+          if (!/\b(take|obtain|find|pick up|pick|get|collect|receive|gain)\b/i.test(step.action || "")) continue;
           // Skip the last step's gives if it would conflict with already-given items
           const alreadyGiven = new Set((wb.puzzle_chain || []).map(s => s && s.gives ? String(s.gives).toLowerCase() : "").filter(Boolean));
           const remaining = itemNames.filter(n => !alreadyGiven.has(n.toLowerCase()));
@@ -1231,6 +1267,25 @@
             [...roomNames, "NONE", "win"], runGen);
           if (pick === "NONE") { step.unlocks = null; fixes.push(`chain step ${step.step} unlocks → null`); }
           else if (pick) { step.unlocks = pick; fixes.push(`chain step ${step.step} unlocks → '${pick}'`); }
+        }
+      }
+
+      // 5. NPC-before-reachable gaps that deterministic repair skipped.
+      const coh = validateWorldBibleCoherence(wb);
+      for (const gap of coh.gaps) {
+        const npcMatch = gap.match(/step (\d+) NPC '([^']+)' not reachable/);
+        if (!npcMatch) continue;
+        const stepNum = parseInt(npcMatch[1], 10);
+        const npcName = npcMatch[2];
+        const npc = (wb.npcs || []).find(n => n && n.name === npcName);
+        if (!npc) continue;
+        const choices = reachableRoomsAtStep(wb, stepNum);
+        if (!choices.length) continue;
+        slog(`micro-repair: NPC '${npcName}' not reachable at step ${stepNum} — asking Gemma`);
+        const pick = await askOneChoice(`Where should ${npcName} be at step ${stepNum}?`, choices, runGen);
+        if (pick) {
+          npc.location = pick;
+          fixes.push(`npc '${npcName}' relocated → '${pick}' (micro-repair step ${stepNum})`);
         }
       }
 
@@ -1424,8 +1479,16 @@
       const candidateB = await runAtomicPass("puzzle_chain.B", runGen, sysMsg, promptB,
         slog, sstream, { tokens: 1000, temp: 0.4, field: "puzzle_chain", minItems: 4 });
 
-      const scoreA = scoreChainCandidate(candidateA, roomNames, itemNames, firstRoom, lastRoom);
-      const scoreB = scoreChainCandidate(candidateB, roomNames, itemNames, firstRoom, lastRoom);
+      const scoreA = scoreChainCandidate(candidateA, roomNames, itemNames, firstRoom, lastRoom, {
+        itemLocations: content.item_locations,
+        npcs: content.npcs || [],
+        locations: skeleton.rooms.map(r => ({ name: r.name, exits: r.exits || [] })),
+      });
+      const scoreB = scoreChainCandidate(candidateB, roomNames, itemNames, firstRoom, lastRoom, {
+        itemLocations: content.item_locations,
+        npcs: content.npcs || [],
+        locations: skeleton.rooms.map(r => ({ name: r.name, exits: r.exits || [] })),
+      });
       const lenA = (candidateA && candidateA.puzzle_chain) ? candidateA.puzzle_chain.length : 0;
       const lenB = (candidateB && candidateB.puzzle_chain) ? candidateB.puzzle_chain.length : 0;
       slog(`agent: chain candidate A=${lenA} steps score=${scoreA}; B=${lenB} steps score=${scoreB}`);
@@ -1778,7 +1841,8 @@
           description: r.desc || r.description || "",
           exits: r.exits || [],
           items,
-          scenery: []
+          scenery: [],
+          image_hint: truncateAtWordBoundary(r.desc || r.description || "", 60),
         };
       });
 
@@ -1837,6 +1901,25 @@
         slog("auto-repair: no mechanical fixes needed");
       }
 
+      // Coherence repair + monster weakness_item derivation (code-only, chain-canonical).
+      const cohRepairs = repairWorldBibleCoherence(plan);
+      const weakFixes = deriveMonsterWeaknessItems(plan);
+      const allCohFixes = [...cohRepairs, ...weakFixes];
+      if (allCohFixes.length) {
+        slog(`coherence-repair: ${allCohFixes.length} fix(es) applied`);
+        for (const f of allCohFixes) slog(`  coherence: ${f}`);
+        for (const loc of plan.locations) loc.items = [];
+        for (const [item, room] of Object.entries(plan.item_locations || {})) {
+          const placeRoom = typeof room === "string" && plan.locations.some(l => l.name === room)
+            ? room
+            : plan.locations.find(l => typeof room === "string" && room.toLowerCase().includes(l.name.toLowerCase()))?.name;
+          if (placeRoom) {
+            const target = plan.locations.find(l => l.name === placeRoom);
+            if (target && !target.items.includes(item)) target.items.push(item);
+          }
+        }
+      }
+
       const { valid, issues } = validateWorldBible(plan);
       if (!valid) console.warn("[world_bible] Validation issues:", issues);
       const finalSummary = `Final: ${plan.locations.length} rooms, ${plan.key_items.length} items, ${plan.puzzle_chain.length} chain steps`;
@@ -1849,12 +1932,17 @@
       // bibles are usually fine; saves an Ollama round-trip).
       let sol = validateWorldBibleSolvability(plan);
       slog(sol.report);
-      if (!sol.ok && !useOllama && llmPipe) {
-        slog(`micro-repair: ${sol.gaps.length} gap(s) remain after auto-repair — asking Gemma single-question fixups`);
+      let coh = validateWorldBibleCoherence(plan);
+      slog(coh.report);
+      if ((!sol.ok || !coh.ok) && !useOllama && llmPipe) {
+        slog(`micro-repair: ${sol.gaps.length} solvability + ${coh.gaps.length} coherence gap(s) — asking Gemma single-question fixups`);
         const microFixes = await microRepairWorldBible(plan, runGen, slog);
         if (microFixes.length) {
           slog(`micro-repair: ${microFixes.length} fix(es) applied`);
           for (const f of microFixes) slog(`  micro-fix: ${f}`);
+          const postMicroCoh = repairWorldBibleCoherence(plan);
+          const postMicroWeak = deriveMonsterWeaknessItems(plan);
+          for (const f of [...postMicroCoh, ...postMicroWeak]) slog(`  coherence: ${f}`);
           // Re-derive locations[].items from item_locations (in case micro-repair changed them).
           for (const loc of plan.locations) loc.items = [];
           for (const [item, room] of Object.entries(plan.item_locations || {})) {
@@ -1863,6 +1951,8 @@
           }
           sol = validateWorldBibleSolvability(plan);
           slog(`post-micro-repair ${sol.report}`);
+          coh = validateWorldBibleCoherence(plan);
+          slog(`post-micro-repair ${coh.report}`);
         } else {
           slog("micro-repair: no fixes applied (gaps not in repairable categories)");
         }
@@ -1939,8 +2029,10 @@
         const gs = data.gameState;
         gs.roomImageBlobs = gs.roomImageBlobs || {};
         gs.roomsWithImages = gs.roomsWithImages || [];
+        gs.chainStepsDone = gs.chainStepsDone || [];
         stateMgr.state = gs;
       }
+      recomputeActiveGating(activeWorldBible);
       return data;
     }
 
@@ -2001,13 +2093,16 @@
         if (data.gameState) {
           data.gameState.roomImageBlobs = data.gameState.roomImageBlobs || {};
           data.gameState.roomsWithImages = data.gameState.roomsWithImages || [];
+          data.gameState.chainStepsDone = data.gameState.chainStepsDone || [];
           stateMgr.state = data.gameState;
         }
+        recomputeActiveGating(activeWorldBible);
         return { hasGameState: !!data.gameState };
       }
       // Assume the file IS a world bible directly (has locations, objectives, etc.)
       if (data.locations || data.objectives || data.win_condition) {
         activeWorldBible = data;
+        recomputeActiveGating(activeWorldBible);
         return { hasGameState: false };
       }
       throw new Error("Unrecognized JSON format — expected a world bible or adventure save");
@@ -2129,6 +2224,20 @@
               }
             }
             debug.push(`move: ${dest}${isNew ? " (new room discovered)" : ""}`);
+            if (wb && activeGating.lockedRooms && activeGating.lockedRooms.has(dest)) {
+              const unlockStep = activeGating.unlockStepByRoom.get(dest);
+              const chain = wb.puzzle_chain || [];
+              const invCanon = new Set(stateMgr.state.inventory.map(i => snapItemToBible(i, wb)));
+              const { doneCount } = computeChainProgress(chain, {
+                inventoryCanonical: invCanon,
+                gameFlags: stateMgr.state.gameFlags,
+                explicitDone: stateMgr.state.chainStepsDone,
+                wb,
+              });
+              if (unlockStep && unlockStep > doneCount) {
+                debug.push(`gate-advisory: entered locked room ${dest} (step ${unlockStep} not done)`);
+              }
+            }
           }
 
           // Inventory: add_items / remove_items
@@ -2169,6 +2278,36 @@
           if (updates.set_flag && typeof updates.set_flag === "object" && updates.set_flag.name) {
             stateMgr.state.gameFlags[updates.set_flag.name] = updates.set_flag.value ?? true;
             debug.push(`flag: ${updates.set_flag.name} = ${updates.set_flag.value}`);
+            if (wb && updates.set_flag.name.endsWith("_defeated")) {
+              const mon = (wb.monsters || []).find(m => m && m.name && m.name.replace(/[^a-zA-Z0-9]+/g, "_") === updates.set_flag.name.slice(0, -"_defeated".length));
+              if (mon && mon.weakness_item) {
+                const invCanon = new Set(stateMgr.state.inventory.map(i => snapItemToBible(i, wb)));
+                if (!invCanon.has(mon.weakness_item)) {
+                  debug.push(`combat-advisory: ${mon.name} defeated without ${mon.weakness_item}`);
+                }
+              }
+            }
+          }
+
+          // Explicit puzzle-chain step completion
+          if (updates.complete_step != null) {
+            const n = parseInt(updates.complete_step, 10);
+            const chain = wb && wb.puzzle_chain || [];
+            const invCanon = new Set(stateMgr.state.inventory.map(i => snapItemToBible(i, wb)));
+            const { doneCount } = computeChainProgress(chain, {
+              inventoryCanonical: invCanon,
+              gameFlags: stateMgr.state.gameFlags,
+              explicitDone: stateMgr.state.chainStepsDone,
+              wb,
+            });
+            if (Number.isFinite(n) && n === doneCount + 1) {
+              if (!stateMgr.state.chainStepsDone.includes(n)) {
+                stateMgr.state.chainStepsDone.push(n);
+                debug.push(`chain: step ${n} complete`);
+              }
+            } else if (Number.isFinite(n)) {
+              debug.push(`chain: complete_step ${n} ignored (expected ${doneCount + 1})`);
+            }
           }
 
           // Image prompts
@@ -2185,18 +2324,18 @@
       const flagCount = Object.keys(s.gameFlags).length;
       debug.push(`state: ${s.location} | HP:${s.health} | inv:${s.inventory.length} items | exits:${exitCount} | flags:${flagCount}`);
 
-      // Puzzle chain progress
+      // Puzzle chain progress (ordered prefix — not raw item count)
       const chain = activeWorldBible.puzzle_chain || [];
       if (chain.length) {
         const invCanon = new Set(s.inventory.map(i => snapItemToBible(i, activeWorldBible)));
-        let done = 0;
-        let nextStep = null;
-        for (const step of chain) {
-          if (step.gives && invCanon.has(step.gives)) { done++; }
-          else if (!nextStep) { nextStep = step; }
-        }
+        const { doneCount, nextStep } = computeChainProgress(chain, {
+          inventoryCanonical: invCanon,
+          gameFlags: s.gameFlags,
+          explicitDone: s.chainStepsDone,
+          wb: activeWorldBible,
+        });
         const nextDesc = nextStep ? ` (next: ${nextStep.action})` : " (all done!)";
-        debug.push(`chain: ${done}/${chain.length} steps${nextDesc}`);
+        debug.push(`chain: ${doneCount}/${chain.length} steps${nextDesc}`);
       }
 
       return { narrative, imagePrompts, debug };
@@ -2335,20 +2474,21 @@
       if (missing.length) out.missing_items = missing;
       if (seenNotTaken.length) out.seen_but_not_taken = seenNotTaken;
 
-      // First puzzle_chain step whose `gives` item is not yet in inventory
+      // Next chain step from ordered progress (includes no-gives steps)
       const chain = wb.puzzle_chain || [];
-      for (const step of chain) {
-        if (!step) continue;
-        const gives = step.gives ? String(step.gives) : "";
-        if (gives && !invCanon.has(gives)) {
-          out.next_chain_step = {
-            step: step.step,
-            action: step.action,
-            gives: step.gives || null,
-            unlocks: step.unlocks || null,
-          };
-          break;
-        }
+      const { nextStep } = computeChainProgress(chain, {
+        inventoryCanonical: invCanon,
+        gameFlags: s.gameFlags,
+        explicitDone: s.chainStepsDone || [],
+        wb,
+      });
+      if (nextStep) {
+        out.next_chain_step = {
+          step: nextStep.step,
+          action: nextStep.action,
+          gives: nextStep.gives || null,
+          unlocks: nextStep.unlocks || null,
+        };
       }
 
       // Rooms in the bible the player has never entered
@@ -2394,6 +2534,43 @@
 
       if (activeWorldBible.win_condition) context.win_condition = activeWorldBible.win_condition;
 
+      // Current puzzle-chain goal (keeps small model on-rails)
+      const chain = activeWorldBible.puzzle_chain || [];
+      if (chain.length) {
+        const invCanon = new Set(s.inventory.map(i => snapItemToBible(i, activeWorldBible)));
+        const { nextStep } = computeChainProgress(chain, {
+          inventoryCanonical: invCanon,
+          gameFlags: s.gameFlags,
+          explicitDone: s.chainStepsDone || [],
+          wb: activeWorldBible,
+        });
+        if (nextStep) {
+          context.current_goal = { step: nextStep.step, do: nextStep.action };
+        }
+      }
+
+      // Locked exits from current room (advisory — narrator may refuse)
+      if (activeGating.lockedRooms && activeGating.lockedRooms.size && chain.length) {
+        const invCanon = new Set(s.inventory.map(i => snapItemToBible(i, activeWorldBible)));
+        const { doneCount } = computeChainProgress(chain, {
+          inventoryCanonical: invCanon,
+          gameFlags: s.gameFlags,
+          explicitDone: s.chainStepsDone || [],
+          wb: activeWorldBible,
+        });
+        const lockedLines = [];
+        const curExits = (s.knownMap[loc] || {}).exits || [];
+        for (const ex of curExits) {
+          if (!activeGating.lockedRooms.has(ex)) continue;
+          const unlockStep = activeGating.unlockStepByRoom.get(ex);
+          if (unlockStep && unlockStep > doneCount) {
+            const step = chain.find(st => st && st.step === unlockStep);
+            lockedLines.push(`${ex} (until: ${step ? step.action : `step ${unlockStep}`})`);
+          }
+        }
+        if (lockedLines.length) context.locked = lockedLines.join("; ");
+      }
+
       // Health warnings
       if (s.health <= 0) context.WARNING = "Player is dead!";
       else if (s.health <= 20) context.WARNING = "Health critical!";
@@ -2419,7 +2596,12 @@
         if (mon.location && roomsMatch(mon.location, loc)) {
           // Only inject monster cue if the corresponding _defeated flag has NOT been set
           const mKey = mon.name.replace(/[^a-zA-Z0-9]+/g, "_") + "_defeated";
-          if (!s.gameFlags[mKey]) cues.push(`Monster: ${mon.name}${mon.weakness ? " weakness: " + mon.weakness : ""}`);
+          if (!s.gameFlags[mKey]) {
+            const weakCue = mon.weakness_item
+              ? `weakness: use the ${mon.weakness_item}`
+              : (mon.weakness ? " weakness: " + mon.weakness : "");
+            cues.push(`Monster: ${mon.name}${weakCue}`);
+          }
         }
       }
       for (const riddle of (activeWorldBible.riddles || [])) {
@@ -2689,11 +2871,15 @@
         imgClient = Txt2ImgWorkerClient.createDefault();
         const wasmBase = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
         const imgLoadOpts = {
-          backendPreference: ["webgpu", "wasm"],
+          // When Gemma holds WebGPU, SD on WebGPU often never finishes (tab looks frozen, no image).
+          backendPreference: (navigator.gpu && llmPipe) ? ["wasm"] : ["webgpu", "wasm"],
           wasmPaths: wasmBase,
           wasmNumThreads: navigator.hardwareConcurrency ? Math.min(4, navigator.hardwareConcurrency) : 2,
           wasmSimd: true,
         };
+        if (navigator.gpu && llmPipe) {
+          onProgress({ text: "SD 1.5: WASM backend (LLM uses WebGPU — avoids GPU deadlock)…" });
+        }
         // Point SD 1.5 adapter at local ONNX files when available
         if (useLocalImg) {
           imgLoadOpts.modelBaseUrl = `${LOCAL_MODELS_BASE}/microsoft/stable-diffusion-v1.5-webnn`;
@@ -2720,8 +2906,9 @@
       if (!imgClient || !imgReady) return null;
       const seed = Math.floor(Math.random() * 2147483647);
       if (onStatus) onStatus("Generating scene…");
+      let abortFn = null;
       try {
-        const { promise } = imgClient.generate(
+        const { promise, abort } = imgClient.generate(
           { model: IMG_MODEL_ID, prompt: fullPrompt, seed, steps: IMG_STEPS, guidanceScale: IMG_GUIDANCE },
           (e) => {
             const step = e.count != null && e.total != null ? ` step ${e.count}/${e.total}` : "";
@@ -2729,10 +2916,23 @@
           },
           { busyPolicy: "queue", debounceMs: 200 }
         );
-        const res = await promise;
+        abortFn = abort;
+        let timer;
+        const res = await Promise.race([
+          promise,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`SD 1.5 timed out after ${IMG_GENERATION_TIMEOUT_MS / 1000}s`)),
+              IMG_GENERATION_TIMEOUT_MS
+            );
+          }),
+        ]).finally(() => clearTimeout(timer));
         if (res && res.ok && res.blob) return URL.createObjectURL(res.blob);
+        if (res && !res.ok && onStatus) onStatus(`Image failed: ${res.message || res.reason || "unknown"}`);
       } catch (e) {
         console.warn("Image gen failed:", e);
+        if (onStatus) onStatus(`Image failed: ${e.message || e}`);
+        try { if (abortFn) await abortFn(); } catch (_) { /* ignore */ }
       }
       return null;
     }
@@ -2741,16 +2941,6 @@
     // UI HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
     const $ = (id) => document.getElementById(id);
-
-    /** Version on load screen and in-game header only. */
-    function applyGameVersionLabels() {
-      const label = `v${GAME_VERSION}`;
-      const loadVer = $("load-version");
-      if (loadVer) loadVer.textContent = label;
-      const gameVer = $("game-version");
-      if (gameVer) gameVer.textContent = `Gemma 4B + SD 1.5 — all in browser | ${label}`;
-    }
-    applyGameVersionLabels();
 
     function appendTurn(playerCmd, narrativeText) {
       const div = document.createElement("div");
@@ -2989,6 +3179,9 @@
       if (startRoom !== "Start" && stateMgr.state.knownMap["Start"]) {
         delete stateMgr.state.knownMap["Start"];
       }
+
+      stateMgr.state.chainStepsDone = stateMgr.state.chainStepsDone || [];
+      recomputeActiveGating(wb);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3030,8 +3223,17 @@
       const debugHeader = [`── Turn 0 (start) ──`, `prompt: sys=${sysPrompt.length} user=${kickoff.length} chars`];
 
       showThinking();
+      let llmText;
       const t0 = performance.now();
-      const llmText = await generateLlmResponse(sysPrompt, kickoff);
+      try {
+        llmText = await generateLlmResponse(sysPrompt, kickoff);
+      } catch (e) {
+        removeThinking();
+        const msg = (e && e.message) ? e.message : String(e);
+        appendTurn(null, `(Could not start adventure: ${msg})`);
+        setDebug([...debugHeader, `ERROR: ${msg}`]);
+        return;
+      }
       const elapsed = Math.round(performance.now() - t0);
       removeThinking();
 
@@ -3150,6 +3352,8 @@
         return cut > 10 ? slice.slice(0, cut).trim() : slice.trim();
       };
       if (t.length <= maxChars) return t;
+      const wordCut = truncateAtWordBoundary(t, maxChars);
+      if (wordCut.length > 10) return wordCut;
       return breakAt(t, maxChars);
     }
 
@@ -3195,8 +3399,8 @@
 
     /** One short style token; avoid repeating "glow/crystal" if keys+mood already saturated with light words. */
     function sdShortStyle(theme, coreLower) {
-      let s = (theme || IMAGE_THEME || "dark fantasy").split(",")[0].trim().toLowerCase();
-      if (s.length > SD_STYLE_MAX_CHARS) s = s.slice(0, SD_STYLE_MAX_CHARS).trim();
+      let s = pickSdStylePhrase(theme || IMAGE_THEME);
+      if (s.length > SD_STYLE_MAX_CHARS) s = truncateAtWordBoundary(s, SD_STYLE_MAX_CHARS);
       if ((coreLower.includes("glow") || coreLower.includes("mushroom")) && (s.includes("glow") || s.includes("crystal")))
         s = "dark fantasy painting";
       if (!s) s = "dark fantasy painting";
@@ -3220,6 +3424,17 @@
       for (const n of npcRow) keyParts.push(npcSdCue(n.name));
       for (const m of monRow) keyParts.push(String(m.name));
       for (const sc of sceneryOne) keyParts.push(String(sc));
+
+      // Enrich keys when fewer than 2 phrases (scenery → image_hint → room name)
+      if (keyParts.length < 2) {
+        const sceneryMore = (wbLoc?.scenery || []).slice(keyParts.length, 2);
+        for (const sc of sceneryMore) keyParts.push(String(sc));
+      }
+      if (keyParts.length < 2 && wbLoc?.image_hint) {
+        const hintWords = wbLoc.image_hint.split(/\s+/).filter(w => w.length > 3).slice(0, 2);
+        for (const w of hintWords) keyParts.push(w);
+      }
+      if (keyParts.length < 2) keyParts.push(room);
 
       const keysPrefix = keyParts.slice(0, SD_MAX_KEY_PHRASES).join(", ");
       const keysLower = keysPrefix.toLowerCase();
@@ -3260,25 +3475,44 @@
         return;
       }
 
-      const llmPrompt = imagePrompts.length ? imagePrompts[0] : null;
-      const { full, keysPrefix, mood, style, llmRaw } = composeImagePromptForSD(room, llmPrompt);
+      if (!imgReady) {
+        setImgStatus("Image model not loaded");
+        setDebug([`IMG skipped: SD 1.5 not loaded (text-only mode)`]);
+        return;
+      }
 
-      setDebug([
-        `IMG → SD 1.5 (wide shot, ≤${SD_MAX_KEY_PHRASES} subjects, short):`,
-        `  LLM raw: ${llmRaw || "(none)"}`,
-        `  keys:    ${keysPrefix || "(none)"}`,
-        `  mood:    ${mood || "(stripped / none)"}`,
-        `  style:   ${style}`,
-        `  → SD:    ${full}`
-      ]);
+      try {
+        // Brief pause so Gemma's WebGPU decode can finish before SD worker starts.
+        if (navigator.gpu && llmPipe && IMG_DEFER_AFTER_LLM_MS > 0) {
+          await new Promise((r) => setTimeout(r, IMG_DEFER_AFTER_LLM_MS));
+        }
 
-      const url = await generateSceneImage(full, setImgStatus);
-      if (url) {
-        stateMgr.addRoomImage(room, url);
-        showSceneImage(url);
-        setImgStatus(`${room}`);
-      } else {
-        setImgStatus(imgReady ? "Image generation failed" : "Image model not loaded");
+        const llmPrompt = imagePrompts.length ? imagePrompts[0] : null;
+        const { full, keysPrefix, mood, style, llmRaw } = composeImagePromptForSD(room, llmPrompt);
+
+        setDebug([
+          `IMG → SD 1.5 (wide shot, ≤${SD_MAX_KEY_PHRASES} subjects, short):`,
+          `  LLM raw: ${llmRaw || "(none)"}`,
+          `  keys:    ${keysPrefix || "(none)"}`,
+          `  mood:    ${mood || "(stripped / none)"}`,
+          `  style:   ${style}`,
+          `  → SD:    ${full}`
+        ]);
+
+        const url = await generateSceneImage(full, setImgStatus);
+        if (url) {
+          stateMgr.addRoomImage(room, url);
+          showSceneImage(url);
+          setImgStatus(`${room}`);
+        } else {
+          setImgStatus(imgReady ? "Image generation failed" : "Image model not loaded");
+          setDebug([`IMG failed for ${room} — game continues text-only`]);
+        }
+      } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        console.warn("generateAndShowImage:", e);
+        setImgStatus(`Image error: ${msg}`);
+        setDebug([`IMG error: ${msg}`]);
       }
     }
 
@@ -3599,31 +3833,39 @@
       switchToGame();
 
       // 4. Start the adventure (or restore loaded state)
-      if (needsNewStory) {
-        $("narrative").innerHTML = "";
-        clearDebug();
-        if (pendingWorldGenDebug && pendingWorldGenDebug.length) {
-          setDebug(["── World bible generation / source ──", `active: ${worldSourceLabel()}`, ...pendingWorldGenDebug]);
-          pendingWorldGenDebug = null;
+      try {
+        if (needsNewStory) {
+          $("narrative").innerHTML = "";
+          clearDebug();
+          if (pendingWorldGenDebug && pendingWorldGenDebug.length) {
+            setDebug(["── World bible generation / source ──", `active: ${worldSourceLabel()}`, ...pendingWorldGenDebug]);
+            pendingWorldGenDebug = null;
+          }
+          debugWorldBible(activeWorldBible);
+          await startStory();
+        } else {
+          // Restored from save — rebuild UI from state
+          $("narrative").innerHTML = "";
+          clearDebug();
+          if (pendingWorldGenDebug && pendingWorldGenDebug.length) {
+            setDebug(["── World bible generation / source ──", `active: ${worldSourceLabel()}`, ...pendingWorldGenDebug]);
+            pendingWorldGenDebug = null;
+          }
+          debugWorldBible(activeWorldBible);
+          appendTurn(null, `Adventure resumed. You are in ${stateMgr.state.location}.`);
+          updateStatusPanel(stateMgr);
+          setDebug(["Game loaded from save."]);
+          // Generate an image for the current location
+          generateAndShowImage([]);
         }
-        debugWorldBible(activeWorldBible);
-        await startStory();
-      } else {
-        // Restored from save — rebuild UI from state
-        $("narrative").innerHTML = "";
-        clearDebug();
-        if (pendingWorldGenDebug && pendingWorldGenDebug.length) {
-          setDebug(["── World bible generation / source ──", `active: ${worldSourceLabel()}`, ...pendingWorldGenDebug]);
-          pendingWorldGenDebug = null;
-        }
-        debugWorldBible(activeWorldBible);
-        appendTurn(null, `Adventure resumed. You are in ${stateMgr.state.location}.`);
-        updateStatusPanel(stateMgr);
-        setDebug(["Game loaded from save."]);
-        // Generate an image for the current location
-        generateAndShowImage([]);
+      } catch (e) {
+        removeThinking();
+        const msg = (e && e.message) ? e.message : String(e);
+        appendTurn(null, `(Start failed: ${msg})`);
+        setDebug([`── Start failed ──`, msg]);
+      } finally {
+        setInputEnabled(true);
       }
-      setInputEnabled(true);
     });
 
     // ── In-game: Save button ──
