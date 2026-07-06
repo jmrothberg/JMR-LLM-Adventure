@@ -273,7 +273,7 @@
   <!-- ═══ Loading overlay / Adventure picker ═══ -->
   <div id="loading-overlay">
     <h2 id="load-title">JMR's LLM Adventure</h2>
-    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0">v1.1.6</p>
+    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0">v1.1.7</p>
     <p>A fully LLM-driven text adventure running entirely in your browser.
        Gemma 4B generates the story; Stable Diffusion 1.5 paints the scenes.</p>
     <p style="font-size:0.8rem;color:var(--text-muted)">
@@ -333,7 +333,7 @@
   <header>
     <div>
       <h1>JMR's LLM Adventure</h1>
-      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 — all in browser | v1.1.6</div>
+      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 — all in browser | v1.1.7</div>
     </div>
     <div class="header-actions">
       <button id="btn-save" title="Save world bible and current progress to this browser (localStorage)">Save game</button>
@@ -406,7 +406,7 @@
     // CONFIGURATION
     // ═══════════════════════════════════════════════════════════════════════════
     /** Bump when shipping UI/engine changes — visible on load screen + header. */
-    const GAME_VERSION = "1.1.6";
+    const GAME_VERSION = "1.1.7";
 
     /** Version on load screen and in-game header — run early so it shows even if later init fails. */
     function applyGameVersionLabels() {
@@ -457,7 +457,7 @@
     const IMG_GUIDANCE = 7.5;
     // SD 1.5 + Gemma on the same WebGPU device can hang forever; WASM for SD avoids that.
     const IMG_GENERATION_TIMEOUT_MS = 120000;
-    const IMG_DEFER_AFTER_LLM_MS = 1000;
+    const IMG_DEFER_AFTER_LLM_MS = 1500;
     const IMAGE_THEME = "Dark fantasy cave with glowing crystals, ancient stone architecture, misty atmosphere";
 
     // SD 1.5 rules (simple model, ~77 CLIP tokens): few concrete subjects, one composition hint, no contradictions.
@@ -3366,17 +3366,16 @@
         const wasmThreads = sdWasmThreadCount();
         const isolated = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
         const imgLoadOpts = {
-          // When Gemma holds WebGPU, SD on WebGPU often never finishes (tab looks frozen, no image).
-          backendPreference: (navigator.gpu && llmPipe) ? ["wasm"] : ["webgpu", "wasm"],
+          // v1.1.2 used WebGPU for SD and it worked. v1.1.5 forced WASM when Gemma holds WebGPU,
+          // which broke image gen on many setups. Prefer WebGPU again; WASM is fallback only.
+          // IMG_DEFER_AFTER_LLM_MS pauses after each LLM turn so SD does not contend with Gemma.
+          backendPreference: ["webgpu", "wasm"],
           wasmPaths: wasmBase,
           wasmNumThreads: wasmThreads,
           wasmSimd: true,
         };
-        if (navigator.gpu && llmPipe) {
-          onProgress({ text: "SD 1.5: WASM backend (LLM uses WebGPU — avoids GPU deadlock)…" });
-        }
         if (!isolated && wasmThreads === 1) {
-          onProgress({ text: "SD 1.5: single-thread WASM (use scripts/serve-threaded.py for faster COOP/COEP)…" });
+          onProgress({ text: "SD 1.5 WASM fallback: single-thread (use scripts/serve-threaded.py for COOP/COEP)…" });
         }
         // Point SD 1.5 adapter at local ONNX files when available
         if (useLocalImg) {
@@ -3388,7 +3387,7 @@
         });
         if (res && res.ok) {
           imgReady = true;
-          onProgress({ text: `SD 1.5 loaded (WASM threads=${wasmThreads}, isolated=${isolated}).`, pct: 100 });
+          onProgress({ text: `SD 1.5 loaded (backend=${res.backendUsed || "?"}, wasmThreads=${wasmThreads}).`, pct: 100 });
           return true;
         }
         lastImgError = res?.message || res?.reason || "unknown error";
