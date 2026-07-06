@@ -6,7 +6,9 @@ import {
   extractMapSkeleton,
   validateWorldBible,
   validateWorldBibleSolvability,
+  validateWorldBibleCoherence,
   autoRepairWorldBible,
+  repairWorldBibleCoherence,
   prepareBibleForValidation,
   cloneWorldBible,
   scoreChainCandidate,
@@ -23,6 +25,12 @@ import {
   matchMechanicAction,
   matchChainStep,
   flagKeyFromName,
+  simulateChainPlaythrough,
+  computeChainProgress,
+  deriveMonsterWeaknessItems,
+  truncateAtWordBoundary,
+  pickSdStylePhrase,
+  buildSyntheticPuzzleChain,
 } from "./world_bible_logic.mjs";
 
 /** Known fixture paths (relative to browser_adventure/). */
@@ -49,6 +57,36 @@ function mkMinimalBible(overrides = {}) {
     main_arc: "A short test adventure",
     ...overrides,
   };
+}
+
+/** Xylos-style broken bible from a real generation run (inline fixture). */
+function mkXylosBrokenBible() {
+  return mkMinimalBible({
+    locations: [
+      { name: "Start Chamber", description: "Entry hall", exits: ["Grand Concourse", "Deep Vault"] },
+      { name: "Grand Concourse", description: "Wide hall", exits: ["Start Chamber", "Lyra's Sanctum"] },
+      { name: "Lyra's Sanctum", description: "Oracle chamber", exits: ["Grand Concourse"] },
+      { name: "Deep Vault", description: "Treasure room", exits: ["Start Chamber"] },
+    ],
+    key_items: [
+      { name: "Glyphic Cipher Disk", purpose: "decrypts passages" },
+      { name: "Lumina Shard", purpose: "lights the way" },
+      { name: "Vault Key", purpose: "opens vault" },
+    ],
+    item_locations: {
+      "Glyphic Cipher Disk": "Deep Vault",
+      "Lumina Shard": "Grand Concourse",
+      "Vault Key": "Deep Vault",
+    },
+    npcs: [{ name: "Lyra", location: "Lyra's Sanctum", personality: "oracle", provides: "guidance" }],
+    puzzle_chain: [
+      { step: 1, action: "take Glyphic Cipher Disk at Start Chamber", gives: "Glyphic Cipher Disk", unlocks: null, location: "Start Chamber" },
+      { step: 2, action: "unlock Grand Concourse", gives: null, unlocks: "Grand Concourse", location: "Start Chamber" },
+      { step: 3, action: "seek Lyra's guidance", gives: null, unlocks: "Lyra's Sanctum", location: "Grand Concourse" },
+      { step: 4, action: "claim Vault Key", gives: "Vault Key", unlocks: "win", location: "Deep Vault" },
+    ],
+    win_condition: { required_items: ["Vault Key"], required_location: "Start Chamber", description: "Win" },
+  });
 }
 
 function runCase(name, fn) {
@@ -279,6 +317,197 @@ export async function runWorldBibleTests(opts = {}) {
   regression.push(runCase("flagKeyFromName", () => {
     assert(flagKeyFromName("Stone Dragon", "_defeated") === "Stone_Dragon_defeated");
     return "flag key derived";
+  }));
+
+  regression.push(runCase("gives/placement mismatch repaired", () => {
+    const wb = mkXylosBrokenBible();
+    const coh0 = validateWorldBibleCoherence(wb);
+    assert(!coh0.ok, "expected initial coherence failure");
+    assert(coh0.gaps.some(g => g.includes("gives/placement mismatch")), "expected mismatch gap");
+    repairWorldBibleCoherence(wb);
+    const coh1 = validateWorldBibleCoherence(wb);
+    assert(coh1.ok || !coh1.gaps.some(g => g.includes("gives/placement mismatch")),
+      `placement still mismatched: ${coh1.gaps.join("; ")}`);
+    assert(wb.item_locations["Glyphic Cipher Disk"] === "Start Chamber", "disk should move to Start Chamber");
+    return "placement relocated to step location";
+  }));
+
+  regression.push(runCase("NPC-before-reachable relocated", () => {
+    const wb = mkXylosBrokenBible();
+    repairWorldBibleCoherence(wb);
+    const lyra = (wb.npcs || []).find(n => n.name === "Lyra");
+    assert(lyra, "Lyra missing");
+    assert(lyra.location === "Grand Concourse", `Lyra at ${lyra.location}, expected Grand Concourse`);
+    return `Lyra → ${lyra.location}`;
+  }));
+
+  regression.push(runCase("redundant + duplicate unlock dropped", () => {
+    const wb = mkXylosBrokenBible();
+    const fixes = repairWorldBibleCoherence(wb);
+    const step2 = wb.puzzle_chain.find(s => s.step === 2);
+    assert(step2 && step2.unlocks == null, "redundant unlock step 2 should be null");
+    const coh = validateWorldBibleCoherence(wb);
+    assert(!coh.gaps.some(g => g.startsWith("redundant_unlock")), coh.gaps.join("; "));
+    assert(fixes.some(f => f.includes("redundant") || f.includes("duplicate") || f.includes("shallow")), fixes.join("; "));
+    return fixes.filter(f => f.includes("unlock")).join(" | ") || "unlocks cleaned";
+  }));
+
+  regression.push(await (async () => {
+    const name = "default_cave simulator passes";
+    try {
+      const raw = await fetchFixture("default_cave.json");
+      const prepared = prepareBibleForValidation(raw);
+      const sim = simulateChainPlaythrough(prepared);
+      assert(sim.ok, sim.failures.join("; "));
+      return { name, pass: true, detail: `${prepared.puzzle_chain.length} steps, ${sim.lockedRooms.size} gated` };
+    } catch (e) {
+      return { name, pass: false, detail: e.message || String(e) };
+    }
+  })());
+
+  regression.push(runCase("simulator fails open (empty lockedRooms)", () => {
+    const wb = mkXylosBrokenBible();
+    const sim = simulateChainPlaythrough(wb);
+    assert(!sim.ok, "incoherent bible should fail sim");
+    const failOpen = sim.ok ? sim.lockedRooms : new Set();
+    assert(failOpen.size === 0, "fail-open uses empty locked set when sim fails");
+    return `failures=${sim.failures.length}, gated=0`;
+  }));
+
+  regression.push(runCase("computeChainProgress ordered prefix", () => {
+    const chain = [
+      { step: 1, action: "talk", gives: "torch", unlocks: null },
+      { step: 2, action: "cross bridge", gives: null, unlocks: null },
+      { step: 3, action: "take gem", gives: "gem", unlocks: "win" },
+    ];
+    const wb = mkMinimalBible({ puzzle_chain: chain });
+    const early = computeChainProgress(chain, {
+      inventoryCanonical: new Set(["gem"]),
+      gameFlags: {},
+      explicitDone: [],
+      wb,
+    });
+    assert(early.doneCount === 0, "late item early must not complete middle steps");
+    const mid = computeChainProgress(chain, {
+      inventoryCanonical: new Set(["torch", "gem"]),
+      gameFlags: {},
+      explicitDone: [],
+      wb,
+    });
+    assert(mid.doneCount === 3, `no-gives step 2 auto-satisfies when step 3 done: ${mid.doneCount}`);
+    const withFlag = computeChainProgress(chain, {
+      inventoryCanonical: new Set(["torch"]),
+      gameFlags: {},
+      explicitDone: [1],
+      wb,
+    });
+    assert(withFlag.doneCount >= 1, "explicit complete_step");
+    const badOrder = computeChainProgress(chain, {
+      inventoryCanonical: new Set(),
+      gameFlags: {},
+      explicitDone: [2],
+      wb,
+    });
+    assert(badOrder.doneCount === 0, "out-of-order explicit step ignored");
+    return `early=0, mid=${mid.doneCount}, explicit=${withFlag.doneCount}`;
+  }));
+
+  regression.push(runCase("deriveMonsterWeaknessItems torch", () => {
+    const wb = mkMinimalBible({
+      key_items: [{ name: "torch", purpose: "light" }, { name: "key", purpose: "open" }, { name: "gem", purpose: "win" }],
+      monsters: [{ name: "Troll", location: "Mid", weakness: "panics and flees when shown fire from the torch" }],
+    });
+    deriveMonsterWeaknessItems(wb);
+    assert(wb.monsters[0].weakness_item === "torch", `got ${wb.monsters[0].weakness_item}`);
+    return "torch linked";
+  }));
+
+  regression.push(runCase("truncateAtWordBoundary + pickSdStylePhrase", () => {
+    const t = truncateAtWordBoundary("ornate dark fantasy steampunk corridor", 28);
+    assert(!t.endsWith("steamp"), `mid-word cut: '${t}'`);
+    assert(t.length <= 28, t);
+    assert(pickSdStylePhrase("steampunk cave adventure") === "steampunk fantasy art");
+    return `${t} | steampunk ok`;
+  }));
+
+  regression.push(runCase("scoreChainCandidate prefers coherent chain", () => {
+    const wb = mkXylosBrokenBible();
+    const rooms = wb.locations.map(l => l.name);
+    const items = wb.key_items.map(k => k.name);
+    const ctx = {
+      itemLocations: wb.item_locations,
+      npcs: wb.npcs,
+      locations: wb.locations,
+    };
+    const incoherent = { puzzle_chain: wb.puzzle_chain };
+    const coherent = cloneWorldBible(wb);
+    repairWorldBibleCoherence(coherent);
+    const ctxGood = { ...ctx, itemLocations: coherent.item_locations, npcs: coherent.npcs };
+    const scoreBad = scoreChainCandidate(incoherent, rooms, items, "Start Chamber", "Deep Vault", ctx);
+    const scoreGood = scoreChainCandidate({ puzzle_chain: coherent.puzzle_chain }, rooms, items, "Start Chamber", "Deep Vault", ctxGood);
+    assert(scoreGood > scoreBad, `good=${scoreGood} bad=${scoreBad}`);
+    return `good=${scoreGood} > bad=${scoreBad}`;
+  }));
+
+  regression.push(runCase("synthetic chain passes solvability + simulator", () => {
+    const wb = mkMinimalBible({ puzzle_chain: [] });
+    buildSyntheticPuzzleChain(wb);
+    const sol = validateWorldBibleSolvability(wb);
+    assert(sol.ok, sol.report);
+    const sim = simulateChainPlaythrough(wb);
+    assert(sim.ok, sim.failures.join("; "));
+    return `${wb.puzzle_chain.length} steps OK`;
+  }));
+
+  regression.push(runCase("duplicate gives deduped (last step wins)", () => {
+    const wb = mkMinimalBible({
+      locations: [
+        { name: "Start", description: "Entry", exits: ["End"] },
+        { name: "End", description: "Treasure", exits: ["Start"] },
+      ],
+      key_items: [
+        { name: "lens", purpose: "see" },
+        { name: "key", purpose: "open" },
+        { name: "gem", purpose: "win" },
+      ],
+      item_locations: { lens: "Start", key: "Start", gem: "End" },
+      puzzle_chain: [
+        { step: 1, action: "take lens at Start", gives: "lens", location: "Start" },
+        { step: 2, action: "get key", gives: "key", location: "Start" },
+        { step: 3, action: "claim lens at End", gives: "lens", unlocks: "win", location: "End" },
+      ],
+      win_condition: { required_items: ["lens"], required_location: "Start", description: "Win" },
+    });
+    repairWorldBibleCoherence(wb);
+    const s1 = wb.puzzle_chain.find(s => s.step === 1);
+    const s3 = wb.puzzle_chain.find(s => s.step === 3);
+    assert(s1 && s1.gives == null, "step 1 duplicate cleared");
+    assert(s3 && s3.gives === "lens", "step 3 keeps lens");
+    assert(wb.item_locations.lens === "End", `lens at ${wb.item_locations.lens}`);
+    const coh = validateWorldBibleCoherence(wb);
+    assert(coh.ok, coh.gaps.join("; "));
+    return "lens on step 3, placement End";
+  }));
+
+  regression.push(runCase("scoreChainCandidate penalizes duplicate gives", () => {
+    const rooms = ["Start", "End"];
+    const items = ["lens", "key"];
+    const dup = {
+      puzzle_chain: [
+        { step: 1, gives: "lens", location: "Start", action: "a" },
+        { step: 2, gives: "lens", unlocks: "win", location: "End", action: "b" },
+      ],
+    };
+    const uniq = {
+      puzzle_chain: [
+        { step: 1, gives: "key", location: "Start", action: "a" },
+        { step: 2, gives: "lens", unlocks: "win", location: "End", action: "b" },
+      ],
+    };
+    const scoreDup = scoreChainCandidate(dup, rooms, items, "Start", "End");
+    const scoreUniq = scoreChainCandidate(uniq, rooms, items, "Start", "End");
+    assert(scoreUniq > scoreDup, `uniq=${scoreUniq} dup=${scoreDup}`);
+    return `uniq=${scoreUniq} > dup=${scoreDup}`;
   }));
 
   // ── Live tests on active bible ──

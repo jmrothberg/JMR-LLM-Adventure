@@ -703,7 +703,509 @@ export function mergeRoomAlias(state, alias, canonical) {
   }
 }
 
-export function scoreChainCandidate(chainObj, rooms, items, firstRoom, lastRoom) {
+/** Canonical room where an item is placed, or null if unresolvable prose. */
+export function resolveItemPlacementRoom(itemName, wb) {
+  if (!itemName || !wb) return null;
+  const itemLocs = wb.item_locations || {};
+  const rooms = (wb.locations || []).map(l => l && l.name).filter(Boolean);
+  const roomSet = new Set(rooms);
+  if (!rooms.length) return null;
+
+  let locDesc = itemLocs[itemName];
+  if (locDesc == null) {
+    const keyLower = String(itemName).toLowerCase();
+    for (const [k, v] of Object.entries(itemLocs)) {
+      if (k.toLowerCase() === keyLower) { locDesc = v; break; }
+    }
+  }
+  if (locDesc == null) return null;
+  if (typeof locDesc !== "string") locDesc = String(locDesc);
+
+  if (roomSet.has(locDesc)) return locDesc;
+  for (const rn of rooms) {
+    if (locDesc.toLowerCase().includes(rn.toLowerCase())) return rn;
+  }
+  const snapped = snapRoomToBible(locDesc, wb);
+  return roomSet.has(snapped) ? snapped : null;
+}
+
+/** Canonical room an unlock targets, or null for falsy / "win" / unresolvable prose. */
+export function resolveUnlockRoom(unlocks, wb) {
+  if (!unlocks || unlocks === "win") return null;
+  const rooms = (wb.locations || []).map(l => l && l.name).filter(Boolean);
+  const roomSet = new Set(rooms);
+  if (!rooms.length) return null;
+  const raw = String(unlocks);
+  if (roomSet.has(raw)) return raw;
+  for (const rn of rooms) {
+    if (raw.toLowerCase().includes(rn.toLowerCase())) return rn;
+  }
+  const snapped = snapRoomToBible(raw, wb);
+  return roomSet.has(snapped) ? snapped : null;
+}
+
+/** BFS depth from locations[0]; missing rooms get depth Infinity. */
+export function computeRoomDepths(wb) {
+  const depths = {};
+  if (!wb || !Array.isArray(wb.locations) || !wb.locations.length) return depths;
+  const rooms = wb.locations.map(l => l && l.name).filter(Boolean);
+  const roomSet = new Set(rooms);
+  const adj = {};
+  for (const loc of wb.locations) {
+    if (!loc || !loc.name) continue;
+    adj[loc.name] = (loc.exits || []).filter(e => roomSet.has(e));
+  }
+  const start = rooms[0];
+  const queue = [start];
+  depths[start] = 0;
+  while (queue.length) {
+    const r = queue.shift();
+    for (const next of (adj[r] || [])) {
+      if (depths[next] == null) {
+        depths[next] = depths[r] + 1;
+        queue.push(next);
+      }
+    }
+  }
+  return depths;
+}
+
+/** Build adjacency map and start room from a bible. */
+function bibleAdjacency(wb) {
+  const rooms = (wb.locations || []).map(l => l && l.name).filter(Boolean);
+  const roomSet = new Set(rooms);
+  const adj = {};
+  for (const loc of (wb.locations || [])) {
+    if (!loc || !loc.name) continue;
+    adj[loc.name] = (loc.exits || []).filter(e => roomSet.has(e));
+  }
+  return { rooms, roomSet, adj, start: rooms[0] };
+}
+
+/** Rooms reachable given locked set and completed unlock steps (chain simulation). */
+function reachableAtChainStep(adj, start, lockedRooms, unlockStepByRoom, completedThroughStep) {
+  const canEnter = (room) => {
+    if (!lockedRooms.has(room)) return true;
+    const us = unlockStepByRoom.get(room);
+    return us != null && us <= completedThroughStep;
+  };
+  const reachable = new Set([start]);
+  const queue = [start];
+  while (queue.length) {
+    const r = queue.shift();
+    for (const next of (adj[r] || [])) {
+      if (!canEnter(next)) continue;
+      if (!reachable.has(next)) { reachable.add(next); queue.push(next); }
+    }
+  }
+  return reachable;
+}
+
+/** NPC names mentioned in step action text. */
+function npcsMentionedInAction(action, npcs) {
+  const found = [];
+  const act = String(action || "").toLowerCase();
+  for (const npc of (npcs || [])) {
+    if (!npc || !npc.name) continue;
+    if (act.includes(String(npc.name).toLowerCase())) found.push(npc);
+  }
+  return found;
+}
+
+/** Effective room for a chain step (location, else gives placement, else start). */
+function effectiveStepRoom(step, wb, start) {
+  if (step.location) return step.location;
+  if (step.gives) return resolveItemPlacementRoom(step.gives, wb) || start;
+  return start;
+}
+
+/**
+ * Master coherence check — simulates ideal chain playthrough.
+ * Returns {ok, failures, lockedRooms, unlockStepByRoom, log}.
+ */
+export function simulateChainPlaythrough(wb) {
+  const failures = [];
+  const log = [];
+  const lockedRooms = new Set();
+  const unlockStepByRoom = new Map();
+  if (!wb || !Array.isArray(wb.puzzle_chain) || !wb.puzzle_chain.length) {
+    return { ok: false, failures: ["no puzzle_chain"], lockedRooms, unlockStepByRoom, log };
+  }
+  const { rooms, roomSet, adj, start } = bibleAdjacency(wb);
+  if (!start) {
+    return { ok: false, failures: ["no start room"], lockedRooms, unlockStepByRoom, log };
+  }
+
+  const chain = wb.puzzle_chain.slice().sort((a, b) => (a.step || 0) - (b.step || 0));
+  const seenUnlocks = new Map();
+  const givesCount = new Map();
+  for (const step of chain) {
+    if (!step || !step.gives) continue;
+    const gk = String(step.gives).toLowerCase();
+    givesCount.set(gk, (givesCount.get(gk) || 0) + 1);
+  }
+  for (const [gk, n] of givesCount) {
+    if (n > 1) {
+      const name = (wb.key_items || []).find(k => k && k.name && k.name.toLowerCase() === gk)?.name || gk;
+      failures.push(`duplicate_gives: '${name}' given on ${n} chain steps`);
+    }
+  }
+
+  const reachableFrom = (from) => {
+    const out = new Set();
+    if (!from || !roomSet.has(from)) return out;
+    const q = [from];
+    out.add(from);
+    while (q.length) {
+      const r = q.shift();
+      for (const next of (adj[r] || [])) {
+        if (!out.has(next)) { out.add(next); q.push(next); }
+      }
+    }
+    return out;
+  };
+
+  for (const step of chain) {
+    if (!step) continue;
+    const unlockRoom = resolveUnlockRoom(step.unlocks, wb);
+    if (unlockRoom && unlockRoom !== start) {
+      lockedRooms.add(unlockRoom);
+      unlockStepByRoom.set(unlockRoom, step.step);
+      if (seenUnlocks.has(unlockRoom)) {
+        failures.push(`duplicate_unlock: step ${step.step} and step ${seenUnlocks.get(unlockRoom)} both unlock ${unlockRoom}`);
+      } else {
+        seenUnlocks.set(unlockRoom, step.step);
+      }
+    }
+  }
+
+  const depths = computeRoomDepths(wb);
+
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i];
+    if (!step) continue;
+    const stepNum = step.step != null ? step.step : i + 1;
+    const priorStep = i > 0 ? (chain[i - 1].step != null ? chain[i - 1].step : i) : 0;
+    const reachable = reachableAtChainStep(adj, start, lockedRooms, unlockStepByRoom, priorStep);
+
+    const effRoom = effectiveStepRoom(step, wb, start);
+    if (effRoom && roomSet.has(effRoom) && !reachable.has(effRoom)) {
+      failures.push(`step ${stepNum} room '${effRoom}' not reachable`);
+      log.push(`step ${stepNum}: unreachable room ${effRoom}`);
+    }
+
+    if (step.gives) {
+      const placeRoom = resolveItemPlacementRoom(step.gives, wb);
+      if (placeRoom && !reachable.has(placeRoom)) {
+        failures.push(`step ${stepNum} gives '${step.gives}' placed in unreachable '${placeRoom}'`);
+      }
+      if (step.location && placeRoom && placeRoom !== step.location) {
+        failures.push(`step ${stepNum} gives/placement mismatch: step at '${step.location}' but '${step.gives}' in '${placeRoom}'`);
+      }
+    }
+
+    for (const npc of npcsMentionedInAction(step.action, wb.npcs)) {
+      const npcRoom = npc.location ? snapRoomToBible(npc.location, wb) : null;
+      if (npcRoom && roomSet.has(npcRoom) && !reachable.has(npcRoom)) {
+        failures.push(`step ${stepNum} NPC '${npc.name}' not reachable (at ${npcRoom})`);
+        log.push(`step ${stepNum}: NPC ${npc.name} unreachable`);
+      }
+    }
+
+    const unlockRoom = resolveUnlockRoom(step.unlocks, wb);
+    if (unlockRoom && step.location) {
+      const rawUnlock = String(step.unlocks || "").trim();
+      const exactUnlock = rawUnlock === unlockRoom || rawUnlock.toLowerCase() === unlockRoom.toLowerCase();
+      if (exactUnlock && reachableFrom(step.location).has(unlockRoom)) {
+        const dStep = depths[step.location] ?? 0;
+        const dUnlock = depths[unlockRoom] ?? 0;
+        const unlocksAdjacentFromStart = dStep === 0 && dUnlock === 1;
+        const sameOrShallower = dUnlock <= dStep;
+        if (unlocksAdjacentFromStart || sameOrShallower) {
+          failures.push(`redundant_unlock: step ${stepNum} unlocks already-reachable '${unlockRoom}'`);
+        }
+      }
+    }
+
+    if (unlockRoom && step.location && depths[unlockRoom] != null && depths[step.location] != null
+        && depths[unlockRoom] < depths[step.location]) {
+      failures.push(`unlock_depth_inversion: step ${stepNum} unlocks shallower '${unlockRoom}' from '${step.location}'`);
+    }
+
+    if (!step.gives && !resolveUnlockRoom(step.unlocks, wb) && !npcsMentionedInAction(step.action, wb.npcs).length) {
+      log.push(`step ${stepNum}: dead step (warn)`);
+    }
+  }
+
+  const finalReachable = reachableAtChainStep(adj, start, lockedRooms, unlockStepByRoom,
+    chain.length ? (chain[chain.length - 1].step || chain.length) : 0);
+  normalizeWinCondition(wb);
+  const winLoc = wb.win_condition && wb.win_condition.required_location;
+  if (winLoc && roomSet.has(winLoc) && !finalReachable.has(winLoc)) {
+    failures.push(`win location '${winLoc}' not reachable after chain`);
+  }
+  for (const it of ((wb.win_condition && wb.win_condition.required_items) || [])) {
+    if (!it) continue;
+    let giverReachable = false;
+    for (const step of chain) {
+      if (step && step.gives && String(step.gives).toLowerCase() === String(it).toLowerCase()) {
+        const eff = effectiveStepRoom(step, wb, start);
+        const reach = reachableAtChainStep(adj, start, lockedRooms, unlockStepByRoom,
+          (step.step || 1) - 1);
+        if (eff && reach.has(eff)) giverReachable = true;
+      }
+    }
+    if (!giverReachable) failures.push(`win item '${it}' giver step not reachable`);
+  }
+
+  return { ok: failures.length === 0, failures, lockedRooms, unlockStepByRoom, log };
+}
+
+/** Coherence validator — same shape as solvability report. */
+export function validateWorldBibleCoherence(wb) {
+  const gaps = [];
+  if (!wb) return { ok: false, gaps: ["no bible"], report: "BLOCKED: no bible" };
+  const sim = simulateChainPlaythrough(wb);
+  gaps.push(...sim.failures);
+  const report = gaps.length
+    ? `coherence: ${gaps.length} gap(s)\n  - ` + gaps.join("\n  - ")
+    : `coherence: OK (${(wb.puzzle_chain || []).length} chain steps, ${sim.lockedRooms.size} gated room(s))`;
+  return { ok: gaps.length === 0, gaps, report };
+}
+
+/** Deterministic coherence repair — chain is canonical. Returns fix strings. */
+export function repairWorldBibleCoherence(wb) {
+  const fixes = [];
+  if (!wb || typeof wb !== "object") return fixes;
+  const rooms = (wb.locations || []).map(l => l && l.name).filter(Boolean);
+  const roomSet = new Set(rooms);
+  if (!rooms.length) return fixes;
+  const start = rooms[0];
+  const itemLocs = wb.item_locations = (wb.item_locations && typeof wb.item_locations === "object") ? wb.item_locations : {};
+  const depths = computeRoomDepths(wb);
+  const chain = wb.puzzle_chain || [];
+
+  // 1. Duplicate gives — keep last occurrence per item (win/treasure step wins).
+  const lastGivesIdx = new Map();
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i];
+    if (!step || !step.gives) continue;
+    lastGivesIdx.set(String(step.gives).toLowerCase(), i);
+  }
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i];
+    if (!step || !step.gives) continue;
+    if (lastGivesIdx.get(String(step.gives).toLowerCase()) !== i) {
+      fixes.push(`chain step ${step.step} duplicate gives '${step.gives}' → null (kept on later step)`);
+      step.gives = null;
+    }
+  }
+
+  const unlockFirst = new Map();
+  for (const step of (wb.puzzle_chain || [])) {
+    if (!step) continue;
+    const unlockRoom = resolveUnlockRoom(step.unlocks, wb);
+    if (!unlockRoom) continue;
+    if (unlockFirst.has(unlockRoom)) {
+      step.unlocks = null;
+      fixes.push(`chain step ${step.step} duplicate unlock '${unlockRoom}' → null`);
+    } else {
+      unlockFirst.set(unlockRoom, step.step);
+    }
+  }
+
+  let sim = simulateChainPlaythrough(wb);
+  for (const fail of sim.failures) {
+    if (!fail.startsWith("redundant_unlock:")) continue;
+    const m = fail.match(/step (\d+)/);
+    if (!m) continue;
+    const stepNum = parseInt(m[1], 10);
+    const step = (wb.puzzle_chain || []).find(s => s && s.step === stepNum);
+    if (step) {
+      step.unlocks = null;
+      fixes.push(`chain step ${stepNum} redundant unlock → null`);
+    }
+  }
+
+  for (const step of (wb.puzzle_chain || [])) {
+    if (!step || !step.location) continue;
+    const unlockRoom = resolveUnlockRoom(step.unlocks, wb);
+    if (!unlockRoom || depths[unlockRoom] == null || depths[step.location] == null) continue;
+    if (depths[unlockRoom] < depths[step.location]) {
+      step.unlocks = null;
+      fixes.push(`chain step ${step.step} shallow unlock '${unlockRoom}' → null`);
+    }
+  }
+
+  sim = simulateChainPlaythrough(wb);
+  const { adj } = bibleAdjacency(wb);
+  for (let i = 0; i < (wb.puzzle_chain || []).length; i++) {
+    const step = wb.puzzle_chain[i];
+    if (!step) continue;
+    const stepNum = step.step != null ? step.step : i + 1;
+    const priorStep = i > 0 ? (wb.puzzle_chain[i - 1].step != null ? wb.puzzle_chain[i - 1].step : i) : 0;
+    const reachable = reachableAtChainStep(adj, start, sim.lockedRooms, sim.unlockStepByRoom, priorStep);
+    const effRoom = effectiveStepRoom(step, wb, start);
+    for (const npc of npcsMentionedInAction(step.action, wb.npcs)) {
+      const npcRoom = npc.location ? snapRoomToBible(npc.location, wb) : null;
+      if (npcRoom && roomSet.has(npcRoom) && !reachable.has(npcRoom) && effRoom && roomSet.has(effRoom)) {
+        const hadEarlier = (wb.puzzle_chain || []).slice(0, i).some(s =>
+          s && npcsMentionedInAction(s.action, [npc]).length);
+        if (!hadEarlier) {
+          npc.location = effRoom;
+          fixes.push(`npc '${npc.name}' relocated → ${effRoom} (step ${stepNum})`);
+        }
+      }
+    }
+  }
+
+  sim = simulateChainPlaythrough(wb);
+  for (const fail of sim.failures) {
+    if (!fail.includes("gives/placement mismatch")) continue;
+    const m = fail.match(/step (\d+)/);
+    if (!m) continue;
+    const stepNum = parseInt(m[1], 10);
+    const step = (wb.puzzle_chain || []).find(s => s && s.step === stepNum);
+    if (!step || step.location) continue;
+    if (!step.gives) continue;
+    const giverNpc = (wb.npcs || []).find(n =>
+      n && npcsMentionedInAction(step.action, [n]).length && n.location && roomSet.has(n.location));
+    if (giverNpc) {
+      itemLocs[step.gives] = giverNpc.location;
+      fixes.push(`item_locations['${step.gives}'] → '${giverNpc.location}' (giver NPC)`);
+    }
+  }
+
+  // Final placement sync after all chain edits (single pass — no overwrite races).
+  for (const step of chain) {
+    if (!step || !step.gives || !step.location || !roomSet.has(step.location)) continue;
+    if (itemLocs[step.gives] !== step.location) {
+      itemLocs[step.gives] = step.location;
+      fixes.push(`item_locations['${step.gives}'] → '${step.location}' (chain-canonical)`);
+    }
+  }
+
+  if (normalizeWinCondition(wb)) {
+    fixes.push("win_condition synced after coherence repair");
+  }
+
+  return fixes;
+}
+
+/** Scan monster weakness prose for unique key_item match → weakness_item. */
+export function deriveMonsterWeaknessItems(wb) {
+  const fixes = [];
+  if (!wb) return fixes;
+  const items = (wb.key_items || []).map(k => k && k.name).filter(Boolean);
+
+  const matchItemsInText = (text) => {
+    const w = String(text || "").toLowerCase();
+    if (!w) return [];
+    const matches = [];
+    for (const it of items) {
+      const itLower = String(it).toLowerCase();
+      if (w.includes(itLower) || w.includes(normalizeItemKey(it))) {
+        matches.push(it);
+        continue;
+      }
+      const tokens = normalizeItemKey(it).split(" ").filter(t => t.length >= 4);
+      if (tokens.length && tokens.every(t => w.includes(t))) matches.push(it);
+    }
+    return matches;
+  };
+
+  for (const mon of (wb.monsters || [])) {
+    if (!mon || typeof mon !== "object" || mon.weakness_item) continue;
+    const sources = [mon.weakness, mon.drops, mon.blocks].filter(Boolean).join(" ");
+    const matches = matchItemsInText(sources);
+    if (matches.length === 1) {
+      mon.weakness_item = matches[0];
+      fixes.push(`monster '${mon.name}' weakness_item → '${matches[0]}'`);
+    }
+  }
+  return fixes;
+}
+
+/** Ordered chain progress for gameplay — longest satisfied prefix. */
+export function computeChainProgress(chain, opts = {}) {
+  const { inventoryCanonical = new Set(), gameFlags = {}, explicitDone = [], wb = null } = opts;
+  const explicit = new Set(Array.isArray(explicitDone) ? explicitDone : []);
+  if (!Array.isArray(chain) || !chain.length) {
+    return { doneCount: 0, nextStep: null };
+  }
+
+  const stepSatisfied = (step) => {
+    if (!step) return false;
+    if (explicit.has(step.step)) return true;
+    if (step.gives && inventoryCanonical.has(step.gives)) return true;
+    if (wb) {
+      const unlockRoom = resolveUnlockRoom(step.unlocks, wb);
+      if (unlockRoom) {
+        const flagKey = String(unlockRoom).replace(/[^a-zA-Z0-9]+/g, "_") + "_unblocked";
+        if (gameFlags[flagKey]) return true;
+      }
+    }
+    return false;
+  };
+
+  const isUnobservable = (step) => {
+    if (!step) return false;
+    return !step.gives && !(wb && resolveUnlockRoom(step.unlocks, wb));
+  };
+
+  let doneCount = 0;
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i];
+    if (stepSatisfied(step)) {
+      doneCount = i + 1;
+    } else if (isUnobservable(step) && i + 1 < chain.length && stepSatisfied(chain[i + 1])) {
+      doneCount = i + 1;
+    } else {
+      break;
+    }
+  }
+
+  const nextStep = doneCount < chain.length ? chain[doneCount] : null;
+  return { doneCount, nextStep };
+}
+
+/** Room names reachable at the start of a given chain step (for micro-repair choices). */
+export function reachableRoomsAtStep(wb, stepNum) {
+  const sim = simulateChainPlaythrough(wb);
+  const { adj, start, rooms } = bibleAdjacency(wb);
+  if (!start) return [];
+  const prior = Math.max(0, (stepNum || 1) - 1);
+  return rooms.filter(r => reachableAtChainStep(adj, start, sim.lockedRooms, sim.unlockStepByRoom, prior).has(r));
+}
+
+/** Cut text at last space/comma before limit; strip trailing junk. */
+export function truncateAtWordBoundary(text, maxChars) {
+  if (!text) return "";
+  const t = String(text).trim();
+  if (t.length <= maxChars) return t;
+  const slice = t.slice(0, maxChars);
+  const space = Math.max(slice.lastIndexOf(" "), slice.lastIndexOf(","));
+  let cut = space > 10 ? slice.slice(0, space) : slice;
+  cut = cut.replace(/[,;:\-–—]+$/, "").trim();
+  const orphans = /\b(and|or|with|the|a|an|of|in|on|at|to|for)$/i;
+  cut = cut.replace(orphans, "").trim();
+  return cut;
+}
+
+/** Keyword table for SD style phrase selection. */
+export function pickSdStylePhrase(artStyle) {
+  const s = String(artStyle || "").toLowerCase();
+  if (s.includes("steampunk")) return "steampunk fantasy art";
+  if (s.includes("gothic") || s.includes("dark fantasy") || s.includes("dark")) return "dark fantasy painting";
+  if (s.includes("sci-fi") || s.includes("scifi") || s.includes("science fiction")) return "sci-fi concept art";
+  if (s.includes("watercolor")) return "watercolor illustration";
+  if (s.includes("noir")) return "noir illustration";
+  if (s.includes("pixel")) return "pixel art";
+  if (s.includes("whimsical") || s.includes("storybook")) return "storybook illustration";
+  return "fantasy concept art";
+}
+
+export function scoreChainCandidate(chainObj, rooms, items, firstRoom, lastRoom, context) {
   if (!chainObj || !Array.isArray(chainObj.puzzle_chain)) return -Infinity;
   const chain = chainObj.puzzle_chain;
   if (!chain.length) return -Infinity;
@@ -718,5 +1220,76 @@ export function scoreChainCandidate(chainObj, rooms, items, firstRoom, lastRoom)
   if (last && last.location === lastRoom) score += 5;
   if (last && last.unlocks === "win") score += 5;
   if (last && last.gives && itemSetLower.has(String(last.gives).toLowerCase())) score += 3;
+
+  const givesSeen = new Map();
+  for (const step of chain) {
+    if (!step || !step.gives) continue;
+    const gk = String(step.gives).toLowerCase();
+    givesSeen.set(gk, (givesSeen.get(gk) || 0) + 1);
+  }
+  for (const n of givesSeen.values()) {
+    if (n > 1) score -= 3 * (n - 1);
+  }
+
+  if (context) {
+    const wb = {
+      locations: context.locations || rooms.map(name => ({ name, exits: context.adj?.[name] || [] })),
+      item_locations: context.itemLocations || {},
+      npcs: context.npcs || [],
+      key_items: items.map(name => ({ name })),
+      puzzle_chain: chain,
+      win_condition: {},
+    };
+    const seenUnlocks = new Set();
+    const { adj, start } = bibleAdjacency(wb);
+    const depths = computeRoomDepths(wb);
+    const reachableFrom = (from) => {
+      const out = new Set();
+      if (!from || !roomSet.has(from)) return out;
+      const q = [from];
+      out.add(from);
+      while (q.length) {
+        const r = q.shift();
+        for (const next of (adj[r] || [])) {
+          if (!out.has(next)) { out.add(next); q.push(next); }
+        }
+      }
+      return out;
+    };
+    const lockedRooms = new Set();
+    const unlockStepByRoom = new Map();
+    for (const step of chain) {
+      const ur = resolveUnlockRoom(step.unlocks, wb);
+      if (ur && ur !== start) {
+        lockedRooms.add(ur);
+        unlockStepByRoom.set(ur, step.step);
+      }
+    }
+    for (let i = 0; i < chain.length; i++) {
+      const step = chain[i];
+      if (!step) continue;
+      if (step.gives) {
+        const place = resolveItemPlacementRoom(step.gives, wb);
+        if (place && (!step.location || place === step.location)) score += 2;
+      }
+      const ur = resolveUnlockRoom(step.unlocks, wb);
+      if (ur && step.location) {
+        if (seenUnlocks.has(ur)) score -= 2;
+        else if (reachableFrom(step.location).has(ur)) {
+          const dStep = depths[step.location] ?? 0;
+          const dUnlock = depths[ur] ?? 0;
+          if ((dStep === 0 && dUnlock === 1) || dUnlock <= dStep) score -= 2;
+          else { score += 2; seenUnlocks.add(ur); }
+        } else { score += 2; seenUnlocks.add(ur); }
+      }
+      const prior = i > 0 ? (chain[i - 1].step || i) : 0;
+      const reachable = reachableAtChainStep(adj, start, lockedRooms, unlockStepByRoom, prior);
+      for (const npc of npcsMentionedInAction(step.action, context.npcs)) {
+        const npcRoom = npc.location ? snapRoomToBible(npc.location, wb) : null;
+        if (npcRoom && roomSet.has(npcRoom) && !reachable.has(npcRoom)) score -= 3;
+      }
+    }
+  }
+
   return score;
 }
