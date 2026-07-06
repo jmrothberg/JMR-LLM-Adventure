@@ -389,6 +389,8 @@
       synthesizeAuthorWalkthrough, winConditionText, cloneWorldBible,
       forceSyntheticChainHardFloor, hasChainSolvabilityGaps,
       snapRoomToBible, snapItemToBible, roomsMatch, mergeRoomAlias,
+      normalizeItemToken, splitItemList, matchItem, matchExit,
+      matchMechanicAction, matchChainStep, flagKeyFromName,
     } from "./world_bible_logic.mjs";
     import { runWorldBibleTests, formatTestResults } from "./world_bible_tests.mjs";
 
@@ -2480,6 +2482,488 @@
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // FAST PATH — deterministic commands without LLM (port of Python try_local_command)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /** Reveal world-bible exits/description when entering a room (same as applyLlmDirectives move_to). */
+    function revealRoomFromBible(stateMgr, dest, wb) {
+      const isNew = !stateMgr.state.knownMap[dest];
+      stateMgr.moveTo(dest);
+      if (wb && Array.isArray(wb.locations)) {
+        const wbLoc = wb.locations.find(l => roomsMatch(l.name, dest));
+        if (wbLoc) {
+          const mapEntry = stateMgr.state.knownMap[dest];
+          if (wbLoc.description && !mapEntry.notes) mapEntry.notes = wbLoc.description;
+          if (Array.isArray(wbLoc.exits)) {
+            for (const ex of wbLoc.exits) {
+              const snapEx = snapRoomToBible(ex, wb);
+              if (!mapEntry.exits.includes(snapEx)) mapEntry.exits.push(snapEx);
+            }
+          }
+        }
+      }
+      return isNew;
+    }
+
+    /** Room description for look/move fast-path (uses world bible when available). */
+    function describeLocation(state, loc, wb) {
+      const parts = [];
+      if (wb) {
+        for (const locEntry of (wb.locations || [])) {
+          if (roomsMatch(locEntry.name, loc)) {
+            if (locEntry.description) parts.push(`**${loc}**: ${locEntry.description}`);
+            break;
+          }
+        }
+      }
+      if (!parts.length) {
+        const notes = (state.knownMap[loc] || {}).notes;
+        parts.push(notes ? `**${loc}**: ${notes}` : `You are in **${loc}**.`);
+      }
+      const roomItems = state.roomItems[loc] || [];
+      if (roomItems.length) parts.push(`You see: ${roomItems.join(", ")}.`);
+      const exits = (state.knownMap[loc] || {}).exits || [];
+      if (exits.length) parts.push(`Exits: ${exits.join(", ")}.`);
+      parts.push(`Health: ${state.health}. Carrying: ${state.inventory.length ? state.inventory.join(", ") : "nothing"}.`);
+      return parts.join(" ");
+    }
+
+    /** Key items whose names appear in a mechanic action string. */
+    function itemsMentionedInAction(action, wb) {
+      if (!action || !wb) return [];
+      const actNorm = normalizeItemToken(action);
+      return (wb.key_items || []).map(k => k && k.name).filter(Boolean)
+        .filter(k => actNorm.includes(normalizeItemToken(k)));
+    }
+
+    /** Find inventory item that satisfies a monster weakness string. */
+    function findWeaknessItem(weakness, inventory, wb) {
+      if (!weakness) return null;
+      const wNorm = normalizeItemToken(weakness);
+      for (const item of (inventory || [])) {
+        if (wNorm.includes(normalizeItemToken(item))) return item;
+      }
+      for (const ki of (wb?.key_items || [])) {
+        const kn = normalizeItemToken(ki.name);
+        if (wNorm.includes(kn)) return matchItem(ki.name, inventory || []);
+      }
+      return null;
+    }
+
+    /** Apply a matched mechanic + optional chain step; null if prerequisites fail. */
+    function tryApplyMechanic(stateMgr, command, wb, debug) {
+      if (!wb) return null;
+      const loc = stateMgr.state.location;
+      const mech = matchMechanicAction(command, wb.mechanics, loc);
+      if (!mech) return null;
+
+      const needed = itemsMentionedInAction(mech.action, wb);
+      const inv = stateMgr.state.inventory || [];
+      for (const need of needed) {
+        if (!matchItem(need, inv)) {
+          debug.push(`[fastpath] mechanic needs ${need} — fall through to LLM`);
+          return null;
+        }
+      }
+
+      const step = matchChainStep(command, wb.puzzle_chain, loc)
+        || matchChainStep(mech.action, wb.puzzle_chain, loc);
+
+      if (step?.gives) {
+        const item = snapItemToBible(step.gives, wb);
+        stateMgr.placeItemInRoom(item);
+        debug.push(`[fastpath] mechanic place: ${item}`);
+      }
+
+      const justDefeated = [];
+      for (const mon of (wb.monsters || [])) {
+        if (!mon.location || !roomsMatch(mon.location, loc)) continue;
+        const fk = flagKeyFromName(mon.name, "_defeated");
+        if (stateMgr.state.gameFlags[fk]) continue;
+        const eff = normalizeItemToken(mech.effect || "");
+        const mname = normalizeItemToken(mon.name);
+        if (eff.includes(mname) && /flee|crumble|panics|defeat|pierce|retreat/.test(eff)) {
+          stateMgr.state.gameFlags[fk] = true;
+          justDefeated.push(mon);
+          debug.push(`[fastpath] flag: ${fk}=true`);
+        }
+      }
+
+      for (const mon of justDefeated) {
+        if (!mon.drops) continue;
+        for (const ki of (wb.key_items || [])) {
+          if (normalizeItemToken(mon.drops).includes(normalizeItemToken(ki.name))) {
+            const item = snapItemToBible(ki.name, wb);
+            stateMgr.placeItemInRoom(item);
+            debug.push(`[fastpath] drop: ${item}`);
+          }
+        }
+      }
+
+      debug.push(`[fastpath] mechanic: ${mech.action}`);
+      return mech.effect || "Something changes in the room.";
+    }
+
+    /**
+     * Deterministic local command handler. Returns { narrative, debug, showImage? } or null.
+     * Null = fall through to LLM (ambiguous or story-heavy input).
+     */
+    function tryLocalCommand(stateMgr, playerInput, wb) {
+      if (!playerInput || !playerInput.trim()) return null;
+      const raw = playerInput.trim();
+      const text = raw.toLowerCase();
+      const debug = [];
+      const state = stateMgr.state;
+
+      const parts = text.split(/\s+/);
+      const cmd = parts[0];
+      const arg = text.includes(" ") ? text.slice(text.indexOf(" ") + 1).trim() : "";
+
+      // ── help ──
+      if (cmd === "help" || text === "?") {
+        debug.push("[fastpath] help");
+        return {
+          narrative:
+            "**Engine commands (no LLM call):**\n" +
+            "- `look` / `l` — describe surroundings\n" +
+            "- `examine X` / `x X` / `look at X` — inspect item, NPC, or monster\n" +
+            "- `inventory` / `inv` / `i` — list what you carry\n" +
+            "- `take X` / `get X` / `pick up X` — pick up room items\n" +
+            "- `drop X` / `put down X` — set an item down\n" +
+            "- `go X` / `enter X` / `n/s/e/w` — travel to an exit\n" +
+            "- `map` / `m` — show known map\n" +
+            "- `wait` — pass time\n" +
+            "- `attack` / `use X` / `solve` — handled when unambiguous; else storyteller LLM",
+          debug,
+        };
+      }
+
+      // ── inventory ──
+      if (cmd === "inventory" || cmd === "inv" || cmd === "i") {
+        debug.push("[fastpath] inventory");
+        const inv = state.inventory || [];
+        return {
+          narrative: inv.length ? `You are carrying: ${inv.join(", ")}.` : "Your hands are empty.",
+          debug,
+        };
+      }
+
+      // ── map ──
+      if (cmd === "map" || cmd === "m") {
+        debug.push("[fastpath] map");
+        const lines = Object.entries(state.knownMap).map(([room, info]) => {
+          const here = room === state.location ? " (here)" : "";
+          return `${room}${here} → ${(info.exits || []).join(", ") || "no exits"}`;
+        });
+        return { narrative: lines.join("\n") || "You have not explored anywhere yet.", debug };
+      }
+
+      // ── wait ──
+      if (cmd === "wait") {
+        debug.push("[fastpath] wait");
+        return { narrative: "You pause for a moment, listening to the silence.", debug };
+      }
+
+      // ── look ──
+      if (text === "look" || text === "l" || text === "look around" || text === "examine room") {
+        debug.push("[fastpath] look");
+        return { narrative: describeLocation(state, state.location, wb), debug };
+      }
+
+      // ── examine X ──
+      let examineTarget = null;
+      if (cmd === "examine" || cmd === "x" || cmd === "inspect") examineTarget = arg;
+      else if (text.startsWith("look at ")) examineTarget = text.slice("look at ".length).trim();
+      else if (text.startsWith("study ")) examineTarget = text.slice("study ".length).trim();
+      else if (text.startsWith("check ")) examineTarget = text.slice("check ".length).trim();
+
+      if (examineTarget !== null) {
+        if (!examineTarget) return { narrative: "Examine what?", debug };
+        const invMatch = matchItem(examineTarget, state.inventory || []);
+        if (invMatch) {
+          let purpose = "";
+          if (wb) {
+            for (const ki of (wb.key_items || [])) {
+              if (ki && ki.name && ki.name.toLowerCase() === invMatch.toLowerCase()) {
+                purpose = ki.purpose || "";
+                break;
+              }
+            }
+          }
+          debug.push(`[fastpath] examine inv: ${invMatch}`);
+          return { narrative: `**${invMatch}** (carried). ${purpose || "It feels solid in your hand."}`, debug };
+        }
+        const roomItems = state.roomItems[state.location] || [];
+        const roomMatch = matchItem(examineTarget, roomItems);
+        if (roomMatch) {
+          debug.push(`[fastpath] examine room: ${roomMatch}`);
+          return { narrative: `**${roomMatch}** is here. Try \`take ${roomMatch}\` to pick it up.`, debug };
+        }
+        if (wb) {
+          const targetNorm = normalizeItemToken(examineTarget);
+          for (const npc of (wb.npcs || [])) {
+            if (!npc.name || !npc.location || !roomsMatch(npc.location, state.location)) continue;
+            if (normalizeItemToken(npc.name).includes(targetNorm) || targetNorm.includes(normalizeItemToken(npc.name))) {
+              debug.push(`[fastpath] examine npc: ${npc.name}`);
+              return {
+                narrative: `**${npc.name}** — ${npc.personality || "mysterious"}.` +
+                  (npc.provides ? ` Can provide: ${npc.provides}.` : ""),
+                debug,
+              };
+            }
+          }
+          for (const mon of (wb.monsters || [])) {
+            const fk = flagKeyFromName(mon.name, "_defeated");
+            if (state.gameFlags[fk]) continue;
+            if (!mon.name || !mon.location || !roomsMatch(mon.location, state.location)) continue;
+            if (normalizeItemToken(mon.name).includes(targetNorm) || targetNorm.includes(normalizeItemToken(mon.name))) {
+              debug.push(`[fastpath] examine monster: ${mon.name}`);
+              return {
+                narrative: `**${mon.name}** (${mon.difficulty || "dangerous"}). Weakness: ${mon.weakness || "unknown"}.`,
+                debug,
+              };
+            }
+          }
+        }
+        return null;
+      }
+
+      // ── take ──
+      let takeTarget = null;
+      if (cmd === "take" || cmd === "get" || cmd === "grab") takeTarget = arg;
+      else if (text.startsWith("pick up ")) takeTarget = text.slice("pick up ".length).trim();
+      else if (text.startsWith("collect ") || text.startsWith("gather ")) takeTarget = text.slice(text.indexOf(" ") + 1).trim();
+
+      if (takeTarget !== null) {
+        if (!takeTarget) return { narrative: "Take what?", debug };
+        let roomItems = [...(state.roomItems[state.location] || [])];
+        const taken = [];
+        const misses = [];
+
+        if (takeTarget === "all" || takeTarget === "everything" || /^all(\s|$)/.test(takeTarget)) {
+          for (const item of roomItems) {
+            stateMgr.removeItemFromRoom(item);
+            stateMgr.addItem(item);
+            taken.push(item);
+            debug.push(`[fastpath] take: ${item}`);
+          }
+        } else {
+          for (const piece of splitItemList(takeTarget)) {
+            const match = matchItem(piece, roomItems);
+            if (match && !taken.includes(match)) {
+              stateMgr.removeItemFromRoom(match);
+              stateMgr.addItem(match);
+              taken.push(match);
+              roomItems = roomItems.filter(i => i !== match);
+              debug.push(`[fastpath] take: ${match}`);
+            } else if (!match) {
+              misses.push(piece);
+            }
+          }
+        }
+
+        if (!taken.length && misses.length) {
+          const stillHere = state.roomItems[state.location] || [];
+          debug.push(`[WARN] [fastpath] take MISS: ${misses.join(", ")}`);
+          return {
+            narrative: `You don't see '${misses.join(", ")}' here.` +
+              (stillHere.length ? ` You see: ${stillHere.join(", ")}.` : " The room is empty."),
+            debug,
+          };
+        }
+        const bits = [];
+        if (taken.length === 1) bits.push(`You pick up the **${taken[0]}**.`);
+        else if (taken.length) bits.push(`You pick up: **${taken.join(", ")}**.`);
+        if (misses.length) {
+          const stillHere = state.roomItems[state.location] || [];
+          bits.push(`(You don't see '${misses.join(", ")}' here` +
+            (stillHere.length ? `; visible: ${stillHere.join(", ")}.)` : ".)"));
+        }
+        return { narrative: bits.join(" "), debug };
+      }
+
+      // ── drop ──
+      let dropTarget = null;
+      if (cmd === "drop" || cmd === "leave") dropTarget = arg;
+      else if (text.startsWith("put down ")) dropTarget = text.slice("put down ".length).trim();
+
+      if (dropTarget !== null) {
+        if (!dropTarget) return { narrative: "Drop what?", debug };
+        let inventory = [...(state.inventory || [])];
+        const dropped = [];
+        const misses = [];
+        for (const piece of splitItemList(dropTarget)) {
+          const match = matchItem(piece, inventory);
+          if (match && !dropped.includes(match)) {
+            stateMgr.removeItem(match);
+            stateMgr.placeItemInRoom(match);
+            dropped.push(match);
+            inventory = inventory.filter(i => i !== match);
+            debug.push(`[fastpath] drop: ${match}`);
+          } else if (!match) {
+            misses.push(piece);
+          }
+        }
+        if (!dropped.length && misses.length) {
+          debug.push(`[WARN] [fastpath] drop MISS: ${misses.join(", ")}`);
+          return {
+            narrative: `You aren't carrying '${misses.join(", ")}'.` +
+              (state.inventory.length ? ` You have: ${state.inventory.join(", ")}.` : " Your hands are empty."),
+            debug,
+          };
+        }
+        const bits = [];
+        if (dropped.length === 1) bits.push(`You set the **${dropped[0]}** down in **${state.location}**.`);
+        else if (dropped.length) bits.push(`You set down in **${state.location}**: **${dropped.join(", ")}**.`);
+        if (misses.length) bits.push(`(You weren't carrying '${misses.join(", ")}'.)`);
+        return { narrative: bits.join(" "), debug };
+      }
+
+      // ── movement ──
+      const exits = (state.knownMap[state.location] || {}).exits || [];
+      let moveTarget = null;
+      if ((cmd === "go" || cmd === "move" || cmd === "enter" || cmd === "head" || cmd === "travel") && arg) {
+        moveTarget = matchExit(arg, exits);
+      } else if (["north", "south", "east", "west", "up", "down", "n", "s", "e", "w", "u", "d"].includes(cmd)) {
+        moveTarget = matchExit(cmd, exits);
+      } else if (exits.length && exits.some(x => x.toLowerCase() === text)) {
+        moveTarget = exits.find(x => x.toLowerCase() === text);
+      }
+
+      if (moveTarget) {
+        const isNew = revealRoomFromBible(stateMgr, moveTarget, wb);
+        debug.push(`[fastpath] move_to: ${moveTarget}${isNew ? " (new)" : ""}`);
+        const bits = [`You enter **${moveTarget}**.`];
+        const wbLoc = wb?.locations?.find(l => roomsMatch(l.name, moveTarget));
+        if (wbLoc?.description) bits.push(wbLoc.description);
+        const roomItems = state.roomItems[moveTarget] || [];
+        if (roomItems.length) bits.push(`You see: ${roomItems.join(", ")}.`);
+        const newExits = (state.knownMap[moveTarget] || {}).exits || [];
+        if (newExits.length) bits.push(`Exits: ${newExits.join(", ")}.`);
+        return { narrative: bits.join(" "), debug, showImage: true };
+      }
+
+      // ── attack ──
+      for (const prefix of ["attack ", "fight ", "kill ", "hit "]) {
+        if (!text.startsWith(prefix)) continue;
+        const rest = text.slice(prefix.length);
+        const splitParts = rest.split(/\s+with\s+/);
+        const monsterPhrase = splitParts[0].trim();
+        const weaponPhrase = splitParts[1]?.trim() || null;
+        if (!monsterPhrase) return { narrative: "Attack what?", debug };
+
+        const activeMonsters = (wb?.monsters || []).filter(m => {
+          if (!m.name || !m.location || !roomsMatch(m.location, state.location)) return false;
+          return !state.gameFlags[flagKeyFromName(m.name, "_defeated")];
+        });
+        const monNames = activeMonsters.map(m => m.name);
+        const monMatch = matchItem(monsterPhrase, monNames);
+        if (!monMatch || monNames.filter(n => matchItem(monsterPhrase, [n])).length > 1) return null;
+
+        const mon = activeMonsters.find(m => m.name === monMatch);
+        let weapon = weaponPhrase ? matchItem(weaponPhrase, state.inventory || []) : null;
+        if (!weapon) weapon = findWeaknessItem(mon.weakness, state.inventory, wb);
+        if (!weapon) {
+          debug.push(`[fastpath] attack needs weakness item — fall through to LLM`);
+          return null;
+        }
+
+        stateMgr.state.gameFlags[flagKeyFromName(mon.name, "_defeated")] = true;
+        debug.push(`[fastpath] attack: ${mon.name} with ${weapon}`);
+        if (mon.drops) {
+          for (const ki of (wb.key_items || [])) {
+            if (normalizeItemToken(mon.drops).includes(normalizeItemToken(ki.name))) {
+              stateMgr.placeItemInRoom(snapItemToBible(ki.name, wb));
+              debug.push(`[fastpath] drop: ${ki.name}`);
+            }
+          }
+        }
+        const chainStep = (wb?.puzzle_chain || []).find(s =>
+          s.action && normalizeItemToken(s.action).includes(normalizeItemToken(mon.name))
+        );
+        if (chainStep?.gives) {
+          const item = snapItemToBible(chainStep.gives, wb);
+          stateMgr.placeItemInRoom(item);
+          debug.push(`[fastpath] place: ${item}`);
+        }
+        return {
+          narrative: `You strike **${mon.name}** with the **${weapon}**. ${mon.weakness || "It falls."}`,
+          debug,
+        };
+      }
+
+      // ── use X / use X on Y ──
+      if (text.startsWith("use ")) {
+        const useOn = text.match(/^use\s+(.+?)\s+on\s+(.+)$/);
+        const cmdForMech = useOn ? `use ${useOn[1]} on ${useOn[2]}` : text;
+        const mechResult = tryApplyMechanic(stateMgr, cmdForMech, wb, debug);
+        if (mechResult) return { narrative: mechResult, debug };
+        if (useOn) return null;
+        const useName = text.slice(4).trim();
+        if (matchItem(useName, state.inventory || [])) {
+          const mech2 = tryApplyMechanic(stateMgr, text, wb, debug);
+          if (mech2) return { narrative: mech2, debug };
+        }
+        return null;
+      }
+
+      // ── solve ──
+      if (text === "solve" || text === "solve riddle" || text === "solve the riddle") {
+        const mechResult = tryApplyMechanic(stateMgr, text, wb, debug);
+        if (mechResult) return { narrative: mechResult, debug };
+        return null;
+      }
+      if (text.startsWith("solve")) {
+        const rest = text.slice(5).trim().replace(/^riddle with\s+/, "").replace(/^the riddle with\s+/, "");
+        if (rest) {
+          const mechResult = tryApplyMechanic(stateMgr, rest, wb, debug);
+          if (mechResult) return { narrative: mechResult, debug };
+        }
+        return null;
+      }
+
+      // ── answer TEXT ──
+      if (text.startsWith("answer ")) {
+        const ans = text.slice(7).trim();
+        if (!ans) return { narrative: "Answer what?", debug };
+        if (wb) {
+          const riddlesHere = (wb.riddles || []).filter(r => r.location && roomsMatch(r.location, state.location));
+          const matches = riddlesHere.filter(r => {
+            const sol = normalizeItemToken(r.solution || "");
+            const a = normalizeItemToken(ans);
+            if (!sol || sol.includes("not a puzzle")) return false;
+            const aToks = a.split(" ").filter(Boolean);
+            return aToks.length >= 2 && aToks.every(t => sol.includes(t));
+          });
+          if (matches.length === 1) {
+            const r = matches[0];
+            debug.push(`[fastpath] answer riddle: ${r.hint}`);
+            const mechResult = tryApplyMechanic(stateMgr, r.solution, wb, debug);
+            return { narrative: mechResult || r.reward || "The puzzle yields to your answer.", debug };
+          }
+        }
+        return null;
+      }
+
+      // ── feature verbs (open/light/push/pull/play/listen) ──
+      for (const prefix of ["listen to ", "play ", "push ", "pull ", "light ", "open ", "close ", "listen "]) {
+        if (!text.startsWith(prefix)) continue;
+        const target = text.slice(prefix.length).trim();
+        const synthetic = target ? `${prefix.trim()} ${target}` : prefix.trim();
+        const mechResult = tryApplyMechanic(stateMgr, synthetic, wb, debug);
+        if (mechResult) return { narrative: mechResult, debug };
+        if (text.startsWith("light ") || text.startsWith("open ")) {
+          const alt = target ? `use ${target}` : text;
+          const mech2 = tryApplyMechanic(stateMgr, alt, wb, debug);
+          if (mech2) return { narrative: mech2, debug };
+        }
+        return null;
+      }
+
+      return null;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // WIN CONDITION CHECK
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -3056,29 +3540,16 @@
     async function handleTurn(playerInput) {
       if (!playerInput.trim()) return;
 
-      // Quick local commands
-      const cmd = playerInput.trim().toLowerCase();
-      if (cmd === "look" || cmd === "look around") {
-        const s = stateMgr.state;
-        const items = s.roomItems[s.location] || [];
-        const exits = (s.knownMap[s.location] || {}).exits || [];
-        let desc = `You are in ${s.location}.`;
-        if (items.length) desc += ` You see: ${items.join(", ")}.`;
-        if (exits.length) desc += ` Exits: ${exits.join(", ")}.`;
-        desc += ` Health: ${s.health}. Carrying: ${s.inventory.length ? s.inventory.join(", ") : "nothing"}.`;
-        appendTurn(playerInput, desc);
-        return;
-      }
-      if (cmd === "inv" || cmd === "inventory") {
-        appendTurn(playerInput, stateMgr.state.inventory.length ? `Carrying: ${stateMgr.state.inventory.join(", ")}` : "You're not carrying anything.");
-        return;
-      }
-      if (cmd === "map") {
-        const lines = Object.entries(stateMgr.state.knownMap).map(([room, info]) => {
-          const here = room === stateMgr.state.location ? " (here)" : "";
-          return `${room}${here} → ${(info.exits || []).join(", ") || "no exits"}`;
-        });
-        appendTurn(playerInput, lines.join("\n"));
+      // Fast-path: deterministic commands skip LLM entirely (~60% of typical inputs)
+      const local = tryLocalCommand(stateMgr, playerInput, activeWorldBible);
+      if (local) {
+        turnCounter++;
+        appendTurn(playerInput, local.narrative);
+        updateStatusPanel(stateMgr);
+        setDebug([`── Turn ${turnCounter} ──`, `route: fast_path`, ...local.debug]);
+        const win = checkWinCondition(stateMgr);
+        if (win) appendTurn(null, `\n🏆 ${win}`);
+        if (local.showImage) generateAndShowImage([]);
         return;
       }
 

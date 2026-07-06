@@ -108,20 +108,26 @@ The story is **not** a fixed script. Each beat is produced by a **text-generatio
 ```mermaid
 flowchart LR
   subgraph each_turn [Each turn]
-    A[Player text] --> B[Build user prompt with JSON game state]
+    A[Player text] --> FP{tryLocalCommand}
+    FP -->|handled| H[Instant response plus state update]
+    FP -->|null| B[Build user prompt with JSON game state]
     B --> C[System instructions plus world hints]
     C --> D[Gemma generates text]
     D --> E[Parse narration plus JSON block]
     E --> F[Apply state_updates to in-memory state]
     F --> G[Optional SD 1.5 image from images array]
+    H --> G
   end
   G --> A
 ```
 
-1. **Your input** (e.g. “pick up the torch”, “go north”) is appended to a **structured snapshot** of the game (location, inventory, map, flags, notes, recent dialogue).
-2. The model receives **system instructions** that tell it exactly how to format its reply: prose first, then a fenced ` ```json ` block with `state_updates` and `images`.
-3. JavaScript **strips** the JSON from what you read and **applies** the directives (move, connect rooms, items, health, flags, etc.).
-4. **Images** are separate: the first image prompt (plus a fixed art-style suffix) is sent to **Stable Diffusion 1.5** in a Web Worker. Room images are **cached in memory** (blob URLs) so revisiting a room does not always re-render.
+**Fast-path commands** (no LLM call — check Debug for `route: fast_path`): `look`, `inv`, `map`, `go`/`n`/`s`/`e`/`w`, `take`/`drop`, `examine`, `wait`, `help`, and unambiguous `attack`/`use`/`solve`/`answer` when world-bible mechanics match. See [`browser_adventure/README.md`](browser_adventure/README.md) for the full table.
+
+1. **Your input** is first checked against **`tryLocalCommand()`**. Common adventure verbs update state instantly (~60% of typical exploration turns).
+2. If not handled locally, input is appended to a **structured snapshot** of the game (location, inventory, map, flags, notes, recent dialogue).
+3. The model receives **system instructions** that tell it exactly how to format its reply: prose first, then a fenced ` ```json ` block with `state_updates` and `images`.
+4. JavaScript **strips** the JSON from what you read and **applies** the directives (move, connect rooms, items, health, flags, etc.).
+5. **Images** are separate: the first image prompt (plus a fixed art-style suffix) is sent to **Stable Diffusion 1.5** in a Web Worker. Room images are **cached in memory** (blob URLs) so revisiting a room does not always re-render.
 
 So: **the LLM invents the wording and proposes state changes**; **the engine enforces structure** by parsing JSON and updating a single canonical `GameState` object.
 
@@ -379,7 +385,7 @@ The browser page is intentionally smaller in a few areas:
 
 - No **MFLUX** / local FLUX paths; images are **only** SD 1.5 via ONNX in the worker.
 - **Advanced directives** from the Python engine (timers, chain reactions, etc.) are not implemented in the browser `applyLlmDirectives`—only the table above.
-- Per-turn play is still narrator-style prose+JSON (no fast-path commands like `take`, `drop`, `n/s/e/w` yet); see `MAKING_ADVENTURES_GREAT_WITH_SMALL_MODELS.md` for the planned port.
+- Per-turn play uses **fast-path commands** for movement, inventory, look/map, and unambiguous mechanics; everything else is narrator-style prose+JSON via Gemma.
 
 World-bible **generation** parity is now close: the [agent loop](#agent-loop-making-4b-gemma-generate-real-games) above ports the Python sibling's structural strategy (decomposition, plan-then-act, best-of-N, auto-repair, solvability validator, micro-repair) down to standalone 4B Gemma. Ollama remains supported for users who want a heavier remote model to author the bible, but it is no longer required for a real, solvable game.
 

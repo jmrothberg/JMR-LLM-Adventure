@@ -494,6 +494,118 @@ export function roomsMatch(a, b) {
   return ka.length > 0 && ka === kb;
 }
 
+/** Strip articles/punctuation for player-typed item matching (fast-path). */
+export function normalizeItemToken(s) {
+  if (!s) return "";
+  let t = String(s).trim().replace(/^["']|["']$/g, "").replace(/[.,!?]+$/, "");
+  t = t.replace(/^(the|a|an|some|my|that|this)\s+/i, "").trim();
+  t = t.replace(/['']/g, "");
+  t = t.replace(/[_-]/g, " ");
+  t = t.replace(/\s+/g, " ").toLowerCase();
+  return t;
+}
+
+/** Split multi-item command targets: "key, lantern and staff". */
+export function splitItemList(s) {
+  if (!s) return [];
+  const parts = String(s).split(/\s*(?:,|\band\b|&|\bplus\b)\s*/i);
+  const out = parts.map(p => p.trim()).filter(Boolean);
+  return out.length ? out : (String(s).trim() ? [String(s).trim()] : []);
+}
+
+/** Best-effort match of player target against candidate item names. */
+export function matchItem(target, candidates) {
+  if (!target || !candidates || !candidates.length) return null;
+  const tNorm = normalizeItemToken(target);
+  if (!tNorm) return null;
+  for (const c of candidates) {
+    if (String(c).toLowerCase() === String(target).toLowerCase()) return c;
+  }
+  for (const c of candidates) {
+    if (normalizeItemToken(c) === tNorm) return c;
+  }
+  for (const c of candidates) {
+    const cn = normalizeItemToken(c);
+    if (tNorm.includes(cn) || cn.includes(tNorm)) return c;
+  }
+  const tTokens = new Set(tNorm.split(" ").filter(Boolean));
+  if (tTokens.size) {
+    for (const c of candidates) {
+      const cTokens = new Set(normalizeItemToken(c).split(" ").filter(Boolean));
+      if ([...tTokens].every(tok => cTokens.has(tok))) return c;
+    }
+  }
+  return null;
+}
+
+/** Match direction/exit text against known exits list. */
+export function matchExit(text, exits) {
+  if (!exits || !exits.length) return null;
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return null;
+  for (const ex of exits) {
+    if (String(ex).toLowerCase() === t) return ex;
+  }
+  for (const ex of exits) {
+    const el = String(ex).toLowerCase();
+    if (t.includes(el) || el.includes(t)) return ex;
+  }
+  if (t.length <= 5) {
+    for (const ex of exits) {
+      if (String(ex).toLowerCase().startsWith(t[0])) return ex;
+    }
+  }
+  return null;
+}
+
+/** Game flag key from entity name + suffix (e.g. Stone Dragon + _defeated). */
+export function flagKeyFromName(name, suffix) {
+  return String(name || "").replace(/[^a-zA-Z0-9]+/g, "_") + suffix;
+}
+
+/** Tokenize command text for mechanic matching. */
+function commandTokens(text) {
+  return normalizeItemToken(text).split(" ").filter(t => t.length >= 2);
+}
+
+/** Fuzzy-match player command to a mechanics[] entry at current location. Returns mechanic or null. */
+export function matchMechanicAction(command, mechanics, location) {
+  if (!command || !Array.isArray(mechanics) || !location) return null;
+  const cmdToks = commandTokens(command);
+  if (!cmdToks.length) return null;
+  const matches = [];
+  for (const mech of mechanics) {
+    if (!mech || !mech.action || !mech.location) continue;
+    if (!roomsMatch(mech.location, location)) continue;
+    const actToks = commandTokens(mech.action);
+    if (!actToks.length) continue;
+    const overlap = actToks.filter(t => cmdToks.includes(t)).length;
+    const score = overlap / actToks.length;
+    if (score >= 0.5 && overlap >= 2) matches.push({ mech, score, overlap });
+  }
+  if (matches.length !== 1) return null;
+  return matches[0].mech;
+}
+
+/** Find puzzle_chain step whose action fuzzy-matches command at location. */
+export function matchChainStep(command, chain, location) {
+  if (!command || !Array.isArray(chain) || !location) return null;
+  const cmdToks = commandTokens(command);
+  if (!cmdToks.length) return null;
+  const matches = [];
+  for (const step of chain) {
+    if (!step || !step.action) continue;
+    if (step.location && !roomsMatch(step.location, location)) continue;
+    const actToks = commandTokens(step.action);
+    if (!actToks.length) continue;
+    const overlap = actToks.filter(t => cmdToks.includes(t)).length;
+    const score = overlap / actToks.length;
+    if (score >= 0.5 && overlap >= 2) matches.push({ step, score });
+  }
+  if (matches.length !== 1) return null;
+  return matches[0].step;
+}
+
 /** Snap LLM room name to canonical locations[].name; returns raw if no good match. */
 export function snapRoomToBible(rawName, wb) {
   if (!rawName || !wb) return rawName;

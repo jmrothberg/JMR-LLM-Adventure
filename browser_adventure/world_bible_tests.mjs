@@ -16,6 +16,13 @@ import {
   snapItemToBible,
   roomsMatch,
   mergeRoomAlias,
+  normalizeItemToken,
+  splitItemList,
+  matchItem,
+  matchExit,
+  matchMechanicAction,
+  matchChainStep,
+  flagKeyFromName,
 } from "./world_bible_logic.mjs";
 
 /** Known fixture paths (relative to browser_adventure/). */
@@ -216,6 +223,62 @@ export async function runWorldBibleTests(opts = {}) {
     assert(!state.knownMap.Threshold_of_Gloomfang);
     assert(state.roomItems["The Threshold of Gloomfang"].includes("Mithril-threaded Rope"));
     return "alias merged into canonical room";
+  }));
+
+  regression.push(runCase("normalizeItemToken articles and underscores", () => {
+    assert(normalizeItemToken("the runic_key") === "runic key");
+    assert(normalizeItemToken("wizard's staff") === "wizards staff");
+    return "articles/underscores/apostrophes normalized";
+  }));
+
+  regression.push(runCase("splitItemList multi-item", () => {
+    const a = splitItemList("the key, lantern and staff");
+    assert(a.length === 3 && a[0] === "the key" && a[1] === "lantern" && a[2] === "staff");
+    const b = splitItemList("rope plus flint");
+    assert(b.length === 2 && b[0] === "rope" && b[1] === "flint");
+    return "comma/and/plus splits";
+  }));
+
+  regression.push(runCase("matchItem partial and snake_case", () => {
+    const items = ["runic_key", "elven_lantern", "wizards_staff"];
+    assert(matchItem("the key", items) === "runic_key");
+    assert(matchItem("staff", items) === "wizards_staff");
+    assert(matchItem("lantern", items) === "elven_lantern");
+    return "partial token containment works";
+  }));
+
+  regression.push(runCase("matchExit cardinals and substring", () => {
+    const exits = ["Mushroom Grotto", "Dark Passage", "North Tunnel"];
+    assert(matchExit("n", exits) === "North Tunnel");
+    assert(matchExit("dark", exits) === "Dark Passage");
+    assert(matchExit("Mushroom Grotto", exits) === "Mushroom Grotto");
+    return "exit matching works";
+  }));
+
+  regression.push(runCase("matchMechanicAction at location", () => {
+    const mechanics = [
+      { action: "use flint on forge or light forge", effect: "forge ignites", location: "Ancient Forge" },
+      { action: "use rope on bridge", effect: "secures bridge", location: "Underground River" },
+    ];
+    const m = matchMechanicAction("use flint on forge", mechanics, "Ancient Forge");
+    assert(m && m.action.includes("flint"));
+    assert(matchMechanicAction("use flint on forge", mechanics, "Cave Mouth") === null);
+    return "mechanic fuzzy match at location";
+  }));
+
+  regression.push(runCase("matchChainStep single match", () => {
+    const chain = [
+      { step: 6, action: "use flint on forge", gives: "enchanted blade", location: "Ancient Forge" },
+      { step: 7, action: "use iron key on iron door", gives: null, location: "Dragon's Vault" },
+    ];
+    const step = matchChainStep("use flint on forge", chain, "Ancient Forge");
+    assert(step && step.gives === "enchanted blade");
+    return "chain step matched";
+  }));
+
+  regression.push(runCase("flagKeyFromName", () => {
+    assert(flagKeyFromName("Stone Dragon", "_defeated") === "Stone_Dragon_defeated");
+    return "flag key derived";
   }));
 
   // ── Live tests on active bible ──
