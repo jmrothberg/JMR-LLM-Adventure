@@ -273,7 +273,7 @@
   <!-- ═══ Loading overlay / Adventure picker ═══ -->
   <div id="loading-overlay">
     <h2 id="load-title">JMR's LLM Adventure</h2>
-    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0">v1.1.5</p>
+    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0">v1.1.6</p>
     <p>A fully LLM-driven text adventure running entirely in your browser.
        Gemma 4B generates the story; Stable Diffusion 1.5 paints the scenes.</p>
     <p style="font-size:0.8rem;color:var(--text-muted)">
@@ -333,7 +333,7 @@
   <header>
     <div>
       <h1>JMR's LLM Adventure</h1>
-      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 — all in browser | v1.1.5</div>
+      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 — all in browser | v1.1.6</div>
     </div>
     <div class="header-actions">
       <button id="btn-save" title="Save world bible and current progress to this browser (localStorage)">Save game</button>
@@ -406,7 +406,7 @@
     // CONFIGURATION
     // ═══════════════════════════════════════════════════════════════════════════
     /** Bump when shipping UI/engine changes — visible on load screen + header. */
-    const GAME_VERSION = "1.1.5";
+    const GAME_VERSION = "1.1.6";
 
     /** Version on load screen and in-game header — run early so it shows even if later init fails. */
     function applyGameVersionLabels() {
@@ -457,7 +457,7 @@
     const IMG_GUIDANCE = 7.5;
     // SD 1.5 + Gemma on the same WebGPU device can hang forever; WASM for SD avoids that.
     const IMG_GENERATION_TIMEOUT_MS = 120000;
-    const IMG_DEFER_AFTER_LLM_MS = 750;
+    const IMG_DEFER_AFTER_LLM_MS = 1000;
     const IMAGE_THEME = "Dark fantasy cave with glowing crystals, ancient stone architecture, misty atmosphere";
 
     // SD 1.5 rules (simple model, ~77 CLIP tokens): few concrete subjects, one composition hint, no contradictions.
@@ -3348,21 +3348,35 @@
     // ═══════════════════════════════════════════════════════════════════════════
     let imgClient = null;
     let imgReady = false;
+    let lastImgError = null;
+
+    /** WASM threads need SharedArrayBuffer (crossOriginIsolated). GitHub Pages and plain http.server use 1 thread. */
+    function sdWasmThreadCount() {
+      if (typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && navigator.hardwareConcurrency) {
+        return Math.min(4, navigator.hardwareConcurrency);
+      }
+      return 1;
+    }
 
     async function loadImageModel(onProgress) {
       onProgress({ text: `Loading SD 1.5 image model${useLocalImg ? " (local)" : ""}…` });
       try {
         imgClient = Txt2ImgWorkerClient.createDefault();
         const wasmBase = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/";
+        const wasmThreads = sdWasmThreadCount();
+        const isolated = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
         const imgLoadOpts = {
           // When Gemma holds WebGPU, SD on WebGPU often never finishes (tab looks frozen, no image).
           backendPreference: (navigator.gpu && llmPipe) ? ["wasm"] : ["webgpu", "wasm"],
           wasmPaths: wasmBase,
-          wasmNumThreads: navigator.hardwareConcurrency ? Math.min(4, navigator.hardwareConcurrency) : 2,
+          wasmNumThreads: wasmThreads,
           wasmSimd: true,
         };
         if (navigator.gpu && llmPipe) {
           onProgress({ text: "SD 1.5: WASM backend (LLM uses WebGPU — avoids GPU deadlock)…" });
+        }
+        if (!isolated && wasmThreads === 1) {
+          onProgress({ text: "SD 1.5: single-thread WASM (use scripts/serve-threaded.py for faster COOP/COEP)…" });
         }
         // Point SD 1.5 adapter at local ONNX files when available
         if (useLocalImg) {
@@ -3374,20 +3388,26 @@
         });
         if (res && res.ok) {
           imgReady = true;
-          onProgress({ text: "SD 1.5 loaded.", pct: 100 });
+          onProgress({ text: `SD 1.5 loaded (WASM threads=${wasmThreads}, isolated=${isolated}).`, pct: 100 });
           return true;
         }
-        onProgress({ text: `SD 1.5 load failed: ${res?.message || "unknown error"}` });
+        lastImgError = res?.message || res?.reason || "unknown error";
+        onProgress({ text: `SD 1.5 load failed: ${lastImgError}` });
         return false;
       } catch (e) {
-        onProgress({ text: `SD 1.5 load failed: ${e.message}` });
+        lastImgError = e.message || String(e);
+        onProgress({ text: `SD 1.5 load failed: ${lastImgError}` });
         return false;
       }
     }
 
-    /** Generate an image with SD 1.5. `fullPrompt` is the complete string sent to CLIP (caller builds it). */
+    /** Generate an image with SD 1.5. Returns blob URL or null; sets lastImgError on failure. */
     async function generateSceneImage(fullPrompt, onStatus) {
-      if (!imgClient || !imgReady) return null;
+      if (!imgClient || !imgReady) {
+        lastImgError = "SD 1.5 not loaded";
+        return null;
+      }
+      lastImgError = null;
       const seed = Math.floor(Math.random() * 2147483647);
       if (onStatus) onStatus("Generating scene…");
       let abortFn = null;
@@ -3412,10 +3432,12 @@
           }),
         ]).finally(() => clearTimeout(timer));
         if (res && res.ok && res.blob) return URL.createObjectURL(res.blob);
-        if (res && !res.ok && onStatus) onStatus(`Image failed: ${res.message || res.reason || "unknown"}`);
+        lastImgError = (res && (res.message || res.reason)) || "no blob returned";
+        if (onStatus) onStatus(`Image failed: ${lastImgError}`);
       } catch (e) {
+        lastImgError = e.message || String(e);
         console.warn("Image gen failed:", e);
-        if (onStatus) onStatus(`Image failed: ${e.message || e}`);
+        if (onStatus) onStatus(`Image failed: ${lastImgError}`);
         try { if (abortFn) await abortFn(); } catch (_) { /* ignore */ }
       }
       return null;
@@ -3977,7 +3999,7 @@
           setImgStatus(`${room}`);
         } else {
           setImgStatus(imgReady ? "Image generation failed" : "Image model not loaded");
-          setDebug([`IMG failed for ${room} — game continues text-only`]);
+          setDebug([`IMG failed for ${room}: ${lastImgError || "unknown"} — game continues text-only`]);
         }
       } catch (e) {
         const msg = (e && e.message) ? e.message : String(e);

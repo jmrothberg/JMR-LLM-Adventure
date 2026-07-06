@@ -182,6 +182,14 @@ export class SD15Adapter {
                 this.sessions[key] = sess;
             }
 
+            // Preload CLIP tokenizer now — generate() needs it; fail load early if worker cannot fetch it.
+            options.onProgress?.({ phase: 'loading', message: 'Loading CLIP tokenizer...', pct: 99 });
+            try {
+                this.tokenizerFn = await getTokenizer();
+            } catch (e) {
+                return { ok: false, reason: 'internal_error', message: `CLIP tokenizer failed: ${e instanceof Error ? e.message : String(e)}` };
+            }
+
             this.loaded = true;
             return { ok: true, backendUsed: chosen, bytesDownloaded };
         } catch (e) {
