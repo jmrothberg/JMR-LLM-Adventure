@@ -665,6 +665,266 @@ export function snapItemToBible(rawName, wb) {
   return rawName;
 }
 
+/** True if player inventory contains target (bible-aware partial match). */
+export function playerHasItem(target, inventory, wb) {
+  if (!target || !inventory?.length) return false;
+  if (matchItem(target, inventory)) return true;
+  const canon = snapItemToBible(target, wb);
+  return inventory.some(i => snapItemToBible(i, wb) === canon);
+}
+
+/** True if item is still on the ground in loc (live roomItems, not static bible text). */
+export function itemPresentInRoom(itemName, loc, state) {
+  const roomItems = state?.roomItems?.[loc] || [];
+  return !!matchItem(itemName, roomItems);
+}
+
+/** Items held in inventory that belong to loc per bible but are no longer in roomItems. */
+export function itemsTakenFromLocation(loc, state, wb) {
+  if (!loc || !state || !wb) return [];
+  const taken = new Set();
+  const roomItems = state.roomItems?.[loc] || [];
+  const inv = state.inventory || [];
+  const locEntry = (wb.locations || []).find(l => l && roomsMatch(l.name, loc));
+  for (const it of (locEntry?.items || [])) {
+    if (playerHasItem(it, inv, wb) && !matchItem(it, roomItems)) taken.add(snapItemToBible(it, wb));
+  }
+  for (const [item, locDesc] of Object.entries(wb.item_locations || {})) {
+    if (roomsMatch(locDesc, loc) && playerHasItem(item, inv, wb) && !matchItem(item, roomItems)) {
+      taken.add(snapItemToBible(item, wb));
+    }
+  }
+  return [...taken];
+}
+
+/** True when prose mentions a taken item (bible-aware token match). */
+function proseMentionsTakenItem(prose, item, wb) {
+  if (!prose || !item) return false;
+  const proseNorm = normalizeItemToken(prose);
+  const itemNorm = normalizeItemToken(snapItemToBible(item, wb));
+  if (!itemNorm || !proseNorm) return false;
+  if (proseNorm.includes(itemNorm)) return true;
+  const itemToks = itemNorm.split(" ").filter(t => t.length >= 3);
+  if (itemToks.length === 1) {
+    return new RegExp(`\\b${itemToks[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(proseNorm);
+  }
+  if (itemToks.length) return itemToks.every(t => proseNorm.includes(t));
+  return false;
+}
+
+/**
+ * Remove sentences/clauses that mention items no longer in the room.
+ * Keeps static bible prose honest without an LLM call on fast-path look/move.
+ */
+export function stripTakenItemsFromDescription(text, takenItems, wb) {
+  if (!text || !takenItems?.length) return text;
+  const mentionsTaken = (chunk) => takenItems.some(item => proseMentionsTakenItem(chunk, item, wb));
+
+  const sentences = String(text).match(/[^.!?]+[.!?]?/g) || [text];
+  const kept = [];
+  for (const raw of sentences) {
+    const chunk = raw.trim();
+    if (!chunk) continue;
+    if (!mentionsTaken(chunk)) {
+      kept.push(chunk);
+      continue;
+    }
+    // Drop comma/semicolon clauses that name taken items; keep the rest of the sentence.
+    const clauses = chunk.split(/\s*[,;]\s*/);
+    const keptClauses = clauses.filter(cl => !mentionsTaken(cl));
+    if (!keptClauses.length) continue;
+    let sent = keptClauses.join(", ");
+    if (/[.!?]$/.test(chunk) && !/[.!?]$/.test(sent)) sent += ".";
+    kept.push(sent);
+  }
+  const out = kept.join(" ").trim();
+  return out || "The room looks much as you remember it.";
+}
+
+/**
+ * Fast-path room narrative: static description + live items + already-taken grounding.
+ * opts.asParts — return string[] instead of joined prose; includeHeader/includeExits/includeStatus toggle sections.
+ */
+export function formatRoomPresence(state, loc, wb, opts = {}) {
+  const {
+    asParts = false,
+    includeHeader = true,
+    includeExits = true,
+    includeStatus = true,
+    markdown = true,
+  } = opts;
+  const parts = [];
+  const bold = (s) => (markdown ? `**${s}**` : s);
+  let hasDesc = false;
+  const taken = itemsTakenFromLocation(loc, state, wb);
+
+  if (wb) {
+    for (const locEntry of (wb.locations || [])) {
+      if (roomsMatch(locEntry.name, loc)) {
+        if (locEntry.description) {
+          const desc = stripTakenItemsFromDescription(locEntry.description, taken, wb);
+          parts.push(includeHeader ? `${bold(loc)}: ${desc}` : desc);
+          hasDesc = true;
+        }
+        break;
+      }
+    }
+  }
+  if (!hasDesc) {
+    const notes = (state?.knownMap?.[loc] || {}).notes;
+    const groundedNotes = notes ? stripTakenItemsFromDescription(notes, taken, wb) : "";
+    if (includeHeader) {
+      parts.push(groundedNotes ? `${bold(loc)}: ${groundedNotes}` : `You are in ${bold(loc)}.`);
+    } else if (groundedNotes) {
+      parts.push(groundedNotes);
+    }
+  }
+
+  const roomItems = state?.roomItems?.[loc] || [];
+  if (roomItems.length) parts.push(`You see: ${roomItems.join(", ")}.`);
+
+  if (includeExits) {
+    const exits = (state?.knownMap?.[loc] || {}).exits || [];
+    if (exits.length) parts.push(`Exits: ${exits.join(", ")}.`);
+  }
+
+  if (includeStatus) {
+    const health = state?.health ?? 100;
+    const inv = state?.inventory || [];
+    parts.push(`Health: ${health}. Carrying: ${inv.length ? inv.join(", ") : "nothing"}.`);
+  }
+
+  return asParts ? parts : parts.join(" ");
+}
+
+/** Game flag key for a solved riddle at a location. */
+export function riddleFlagKey(riddle) {
+  const loc = riddle?.location || "unknown";
+  const hint = String(riddle?.hint || "").slice(0, 40);
+  const hash = hint.replace(/[^a-zA-Z0-9]+/g, "_").slice(0, 32);
+  return flagKeyFromName(`${loc}_${hash}`, "_solved");
+}
+
+/** True when riddle fast-path or LLM set the solved flag. */
+export function isRiddleSolved(riddle, state) {
+  if (!riddle || !state?.gameFlags) return false;
+  return !!state.gameFlags[riddleFlagKey(riddle)];
+}
+
+/** Set riddle solved flag (fast-path answer / LLM set_flag convention). */
+export function markRiddleSolved(riddle, state) {
+  if (!riddle || !state) return;
+  if (!state.gameFlags) state.gameFlags = {};
+  state.gameFlags[riddleFlagKey(riddle)] = true;
+}
+
+/** True when NPC name tokens overlap chain step action (talk to hermit, etc.). */
+function npcNameInAction(npcName, action) {
+  if (!npcName || !action) return false;
+  const npcToks = commandTokens(npcName);
+  const actToks = commandTokens(action);
+  if (!npcToks.length || !actToks.length) return false;
+  const overlap = npcToks.filter(t => actToks.includes(t)).length;
+  return overlap >= 1 && overlap / npcToks.length >= 0.5;
+}
+
+/**
+ * Gift item name if player already received NPC chain gift or holds item from provides text.
+ * Returns canonical item name or null.
+ */
+export function npcGiftAlreadyReceived(npc, state, wb) {
+  if (!npc || !state || !wb) return null;
+  const inv = state.inventory || [];
+  const chain = wb.puzzle_chain || [];
+  const invCanon = new Set(inv.map(i => snapItemToBible(i, wb)));
+  const { doneCount } = computeChainProgress(chain, {
+    inventoryCanonical: invCanon,
+    gameFlags: state.gameFlags || {},
+    explicitDone: state.chainStepsDone || [],
+    wb,
+  });
+
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i];
+    if (!step?.gives) continue;
+    if (!npcNameInAction(npc.name, step.action)) continue;
+    const gift = snapItemToBible(step.gives, wb);
+    if (playerHasItem(gift, inv, wb)) return gift;
+    if (i < doneCount) return gift;
+  }
+
+  if (npc.provides) {
+    const provNorm = normalizeItemToken(npc.provides);
+    for (const ki of (wb.key_items || [])) {
+      if (!ki?.name) continue;
+      if (provNorm.includes(normalizeItemToken(ki.name)) && playerHasItem(ki.name, inv, wb)) {
+        return snapItemToBible(ki.name, wb);
+      }
+    }
+  }
+  return null;
+}
+
+/** Game flag key for a used mechanic at a location. */
+export function mechanicFlagKey(mech) {
+  const loc = mech?.location || "unknown";
+  const act = String(mech?.action || "").slice(0, 48);
+  return flagKeyFromName(`${loc}_${act}`, "_done");
+}
+
+/** Set mechanic-applied flag after fast-path tryApplyMechanic. */
+export function markMechanicApplied(mech, state) {
+  if (!mech || !state) return;
+  if (!state.gameFlags) state.gameFlags = {};
+  state.gameFlags[mechanicFlagKey(mech)] = true;
+}
+
+/** True when mechanic chain step satisfied or dedicated _done flag set. */
+export function mechanicAlreadyApplied(mech, state, wb) {
+  if (!mech || !state) return false;
+  if (state.gameFlags?.[mechanicFlagKey(mech)]) return true;
+  if (!wb) return false;
+
+  const invCanon = new Set((state.inventory || []).map(i => snapItemToBible(i, wb)));
+  const chain = wb.puzzle_chain || [];
+  const step = matchChainStep(mech.action, chain, mech.location);
+  if (!step) return false;
+
+  if (step.gives && invCanon.has(snapItemToBible(step.gives, wb))) return true;
+  const unlockRoom = resolveUnlockRoom(step.unlocks, wb);
+  if (unlockRoom) {
+    const ubKey = String(unlockRoom).replace(/[^a-zA-Z0-9]+/g, "_") + "_unblocked";
+    if (state.gameFlags?.[ubKey]) return true;
+  }
+  const { doneCount } = computeChainProgress(chain, {
+    inventoryCanonical: invCanon,
+    gameFlags: state.gameFlags || {},
+    explicitDone: state.chainStepsDone || [],
+    wb,
+  });
+  const idx = chain.indexOf(step);
+  return idx >= 0 && idx < doneCount;
+}
+
+/** Step numbers completed per computeChainProgress prefix. */
+export function completedChainStepNumbers(state, wb) {
+  const chain = wb?.puzzle_chain || [];
+  if (!chain.length || !state) return [];
+  const invCanon = new Set((state.inventory || []).map(i => snapItemToBible(i, wb)));
+  const { doneCount } = computeChainProgress(chain, {
+    inventoryCanonical: invCanon,
+    gameFlags: state.gameFlags || {},
+    explicitDone: state.chainStepsDone || [],
+    wb,
+  });
+  const nums = [];
+  for (let i = 0; i < doneCount && i < chain.length; i++) {
+    const st = chain[i];
+    nums.push(st?.step != null ? st.step : i + 1);
+  }
+  return nums;
+}
+
 /** Merge duplicate room key (LLM alias) into canonical bible room in game state. */
 export function mergeRoomAlias(state, alias, canonical) {
   if (!state || !alias || !canonical || alias === canonical) return;

@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kokoro TTS Test — JMR LLM Adventure</title>
+  <style>
+    :root { --bg:#0a0a12; --panel:#14141f; --border:#252535; --text:#d8d0c4; --muted:#8a8898; --accent:#c9a550; --ok:#7dffb2; --err:#ff8a8a; }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { min-height:100vh; background:var(--bg); color:var(--text); font-family:system-ui,sans-serif; font-size:14px; line-height:1.5; padding:20px; max-width:900px; margin:0 auto; }
+    h1 { color:var(--accent); font-size:1.2rem; margin-bottom:4px; }
+    .sub { color:var(--muted); font-size:0.85rem; margin-bottom:16px; }
+    label { display:block; margin:12px 0 4px; color:var(--muted); font-size:0.8rem; }
+    textarea { width:100%; min-height:120px; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:10px; font:inherit; resize:vertical; }
+    select { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; align-items:center; }
+    button { background:var(--border); color:var(--text); border:1px solid var(--border); padding:8px 14px; border-radius:6px; cursor:pointer; font:inherit; }
+    button.primary { background:var(--accent); color:#111; border-color:var(--accent); font-weight:600; }
+    button:disabled { opacity:0.45; cursor:not-allowed; }
+    #log { background:var(--panel); border:1px solid var(--border); border-radius:6px; padding:10px; min-height:160px; max-height:320px; overflow:auto; font-family:ui-monospace,monospace; font-size:12px; white-space:pre-wrap; margin-top:12px; }
+    #status { margin:8px 0; color:var(--muted); }
+    a { color:var(--accent); }
+  </style>
+</head>
+<body>
+  <h1>Kokoro TTS Test (Phase 0)</h1>
+  <p class="sub">Standalone narrator spike — no Gemma/SD. Serve via <code>python3 scripts/serve-threaded.py</code> → <a href="tts_test.html">tts_test.html</a></p>
+
+  <div id="status">Checking local model…</div>
+
+  <label for="voice">Voice</label>
+  <select id="voice">
+    <option value="af_heart">af_heart (female, grade A)</option>
+    <option value="am_michael">am_michael (male narrator)</option>
+    <option value="bf_emma">bf_emma (British female)</option>
+  </select>
+
+  <label for="text">Sample narrator text</label>
+  <textarea id="text">You stand at the mouth of a wide rocky cave. An old hermit sits beside a crackling campfire, watching you with sharp eyes. A coil of rope hangs from a spike in the wall. Exits lead into shadow to the east and south.</textarea>
+
+  <div class="row">
+    <button class="primary" id="btn-load">Load Kokoro (WASM q8)</button>
+    <button id="btn-speak" disabled>Speak (Kokoro)</button>
+    <button id="btn-speak-md" disabled>Speak markdown-stripped</button>
+    <button id="btn-web">Speak (Web Speech)</button>
+    <button id="btn-stop">Stop</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script type="module">
+    import { KokoroTTS, env as kokoroEnv } from "https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm";
+    import { env as tfEnv } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1/+esm";
+    import {
+      TTS_MODEL_ID, stripMarkdownForSpeech, rawAudioToBlob, probeLocalTts,
+      applyKokoroEnv, seedLocalVoiceCache,
+    } from "../vendor/kokoro-js/kokoro_shared.mjs";
+    import { sdWasmThreadCount } from "./kokoro_shared.mjs";
+
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    let tts = null;
+    let useLocal = false;
+    let audioEl = null;
+    let webUtter = null;
+
+    function log(msg) {
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.textContent = (logEl.textContent ? logEl.textContent + "\n" : "") + line;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg) { $("status").textContent = msg; }
+
+    async function initProbe() {
+      useLocal = await probeLocalTts();
+      const isolated = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
+      setStatus(
+        useLocal
+          ? `Local Kokoro found at local_models/ (offline-ready). crossOriginIsolated=${isolated}`
+          : `No local Kokoro — will download from HuggingFace on load. crossOriginIsolated=${isolated}`
+      );
+      log(`probe: useLocal=${useLocal}, wasmThreads=${sdWasmThreadCount()}, isolated=${isolated}`);
+    }
+
+    $("btn-load").addEventListener("click", async () => {
+      $("btn-load").disabled = true;
+      const t0 = performance.now();
+      try {
+        applyKokoroEnv(kokoroEnv, tfEnv, { useLocal });
+        if (useLocal) {
+          const seeded = await seedLocalVoiceCache($("voice").value);
+          log(`env: localModelPath=/local_models/, voice cache seeded=${seeded}`);
+        } else {
+          log("env: remote HuggingFace");
+        }
+        log(`Loading ${TTS_MODEL_ID} device=wasm dtype=q8…`);
+        const progressSeen = new Set();
+        tts = await KokoroTTS.from_pretrained(TTS_MODEL_ID, {
+          dtype: "q8",
+          device: "wasm",
+          progress_callback: (p) => {
+            if (p?.status === "progress" && p.file && !progressSeen.has(p.file)) {
+              progressSeen.add(p.file);
+              log(`  load: ${p.file}`);
+            }
+          },
+        });
+        const ms = Math.round(performance.now() - t0);
+        log(`Load OK in ${ms} ms`);
+        $("btn-speak").disabled = false;
+        $("btn-speak-md").disabled = false;
+        setStatus(`Kokoro loaded (${ms} ms). device=wasm, local=${useLocal}`);
+      } catch (e) {
+        log(`Load FAILED: ${e.message || e}`);
+        setStatus("Load failed — see log");
+        $("btn-load").disabled = false;
+      }
+    });
+
+    function stopAll() {
+      if (audioEl) { audioEl.pause(); audioEl = null; }
+      if (webUtter) { speechSynthesis.cancel(); webUtter = null; }
+    }
+
+    async function speakKokoro(stripMd) {
+      if (!tts) { log("Load model first"); return; }
+      stopAll();
+      let text = $("text").value.trim();
+      if (!text) return;
+      if (stripMd) text = stripMarkdownForSpeech(text);
+      const voice = $("voice").value;
+      if (useLocal) await seedLocalVoiceCache(voice);
+      const t0 = performance.now();
+      log(`Generate: voice=${voice}, chars=${text.length}${stripMd ? " (markdown-stripped)" : ""}`);
+      try {
+        const raw = await tts.generate(text, { voice });
+        const genMs = Math.round(performance.now() - t0);
+        const blob = rawAudioToBlob(raw);
+        const url = URL.createObjectURL(blob);
+        audioEl = new Audio(url);
+        audioEl.onended = () => URL.revokeObjectURL(url);
+        await audioEl.play();
+        log(`Play started (generate ${genMs} ms)`);
+      } catch (e) {
+        log(`Generate FAILED: ${e.message || e}`);
+      }
+    }
+
+    $("btn-speak").addEventListener("click", () => speakKokoro(false));
+    $("btn-speak-md").addEventListener("click", () => speakKokoro(true));
+
+    $("btn-web").addEventListener("click", () => {
+      stopAll();
+      const text = $("text").value.trim();
+      if (!text) return;
+      webUtter = new SpeechSynthesisUtterance(text);
+      webUtter.rate = 0.95;
+      speechSynthesis.speak(webUtter);
+      log("Web Speech started (OS voice)");
+    });
+
+    $("btn-stop").addEventListener("click", () => {
+      stopAll();
+      log("Stopped");
+    });
+
+    initProbe();
+  </script>
+</body>
+</html>

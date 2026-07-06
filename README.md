@@ -52,7 +52,23 @@ A redirect stub lives at [`adventure.html`](adventure.html) at the repo root.
 
 ## Models — internet vs. local
 
-### Default: just open the page (internet required)
+### Two ways to run (LLM, SD, and Kokoro TTS)
+
+| Mode | Start | First run | After setup / first visit |
+|------|-------|-----------|---------------------------|
+| **A — Local offline** | `./scripts/setup_local.sh` then `python3 scripts/serve-threaded.py` | Downloads ~5.2 GB to `local_models/` | **Fully offline** on localhost — all models from disk |
+| **B — GitHub Pages** | [Play in browser](https://jmrothberg.github.io/JMR-LLM-Adventure/browser_adventure/adventure.html) | Browser downloads from HuggingFace Hub | **Runs locally in-browser** — cached weights; enable **Narration** for Kokoro TTS |
+
+**Mode A (recommended for air-gapped / fast reload):**
+
+```bash
+./scripts/setup_local.sh
+python3 scripts/serve-threaded.py
+```
+
+**Mode B:** No install. First load fetches models (~5.1 GB total); reload uses browser cache. Kokoro narrator loads lazily when you turn **Narration: On** (~86 MB first time).
+
+### Default: just open the page (Mode B — internet required first time)
 
 Most users don't need to download anything manually. Open the GitHub Pages link (or serve locally) and the browser fetches models from HuggingFace Hub on first load, then caches them:
 
@@ -61,8 +77,9 @@ Most users don't need to download anything manually. Open the GitHub Pages link 
 | **Gemma 4 E4B** (ONNX q4) | `onnx-community/gemma-4-E4B-it-ONNX` | ~3.1 GB | Text generation (narrator + game master) |
 | **SD 1.5** (MS WebNN ONNX fp16) | `microsoft/stable-diffusion-v1.5-webnn` | ~1.9 GB | Scene illustration |
 | **CLIP tokenizer** | `Xenova/clip-vit-base-patch16` | ~2 MB | Prompt encoding for SD 1.5 |
+| **Kokoro 82M TTS** (ONNX q8) | `onnx-community/Kokoro-82M-v1.0-ONNX` | ~86 MB | Optional narrator speech (toggle in game) |
 
-First load is **~5 GB** total (browser-cached afterward). **WebGPU** (Chrome/Edge 113+) is strongly recommended; WASM fallback works but is much slower.
+First load is **~5.1 GB** total (browser-cached afterward). **WebGPU** (Chrome/Edge 113+) is strongly recommended for Gemma/SD; Kokoro TTS uses **WASM/CPU** only. WASM fallback for LLM/SD works but is much slower.
 
 ### Optional: fully offline / local files
 
@@ -70,8 +87,23 @@ For faster loading or air-gapped machines, download the model files once to `loc
 
 **Prerequisite:** `pip install huggingface_hub` (one time).
 
+**Unified script (recommended for Mode A):**
+
 ```bash
-cd /path/to/Colossal_Cave
+./scripts/setup_local.sh
+# or: python3 scripts/download_models.py
+```
+
+Download a subset only, e.g. TTS for the test page:
+
+```bash
+python3 scripts/download_models.py --only kokoro
+```
+
+**Manual one-liner** (same files as the script):
+
+```bash
+cd /path/to/JMR-LLM-Adventure
 python3 -c "
 from huggingface_hub import snapshot_download
 # Gemma 4 E4B ONNX (q4) — ~3.1 GB
@@ -92,12 +124,18 @@ snapshot_download('microsoft/stable-diffusion-v1.5-webnn',
 snapshot_download('Xenova/clip-vit-base-patch16',
     allow_patterns=['tokenizer.json','tokenizer_config.json','config.json'],
     local_dir='local_models/Xenova/clip-vit-base-patch16')
+# Kokoro 82M TTS (q8) — ~86 MB + default voice
+snapshot_download('onnx-community/Kokoro-82M-v1.0-ONNX',
+    allow_patterns=['config.json','onnx/*.onnx','onnx/*.onnx_data*','voices/af_heart.bin'],
+    local_dir='local_models/onnx-community/Kokoro-82M-v1.0-ONNX')
 "
 ```
 
-Total: **~5.1 GB**. The `local_models/` directory is git-ignored.
+Total: **~5.2 GB**. The `local_models/` directory is git-ignored.
 
-When serving from localhost, the game probes for each model's files at startup and reports what it found (e.g. "Local model files detected (LLM + SD 1.5)"). Any model not found locally falls back to the normal HuggingFace download.
+**TTS test page (Phase 0):** after downloading Kokoro, serve locally and open `browser_adventure/tts_test.html` to compare Kokoro vs Web Speech before enabling narration in the game.
+
+When serving from localhost, the game probes for each model's files at startup and reports what it found (e.g. "Local model files detected (LLM + SD 1.5 + Kokoro TTS)"). Any model not found locally falls back to the normal HuggingFace download.
 
 ---
 
@@ -397,7 +435,8 @@ For full feature parity (advanced directives, Apple-Silicon-class models, FLUX i
 
 - **Gemma 4 E4B** — ONNX q4, loaded via [`@huggingface/transformers`](https://huggingface.co/docs/transformers.js) (3.1 GB).
 - **SD 1.5** — Microsoft WebNN ONNX fp16, loaded via **`vendor/web-txt2img/`** (1.9 GB).
-- **CLIP tokenizer** — used by SD 1.5 for prompt encoding, loaded via `@xenova/transformers` or `@huggingface/transformers` (2 MB).
+- **CLIP tokenizer** — used by SD 1.5 for prompt encoding (2 MB).
+- **Kokoro 82M TTS** — ONNX q8 via [`kokoro-js`](https://www.npmjs.com/package/kokoro-js) in **`vendor/kokoro-js/`**; lazy-loaded when narration toggle is on (~86 MB).
 
 See [Models — internet vs. local](#models--internet-vs-local) above for download details and sizes.
 

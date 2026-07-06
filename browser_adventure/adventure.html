@@ -273,7 +273,7 @@
   <!-- ═══ Loading overlay / Adventure picker ═══ -->
   <div id="loading-overlay">
     <h2 id="load-title">JMR's LLM Adventure</h2>
-    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0">v1.1.7</p>
+    <p id="load-version" style="font-size:1rem;color:var(--accent);font-weight:bold;margin:6px 0 10px 0">v1.1.8</p>
     <p>A fully LLM-driven text adventure running entirely in your browser.
        Gemma 4B generates the story; Stable Diffusion 1.5 paints the scenes.</p>
     <p style="font-size:0.8rem;color:var(--text-muted)">
@@ -333,9 +333,10 @@
   <header>
     <div>
       <h1>JMR's LLM Adventure</h1>
-      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 — all in browser | v1.1.7</div>
+      <div class="subtitle" id="game-version">Gemma 4B + SD 1.5 + Kokoro TTS — all in browser | v1.1.8</div>
     </div>
     <div class="header-actions">
+      <button id="btn-narration" title="Toggle narrator speech (Kokoro TTS, WASM CPU)">Narration: Off</button>
       <button id="btn-save" title="Save world bible and current progress to this browser (localStorage)">Save game</button>
       <button id="btn-export" title="Download world bible only as JSON (no inventory or progress)—share or edit the setting">Export World</button>
       <button id="btn-new-adventure" title="Start a different adventure">New Adventure</button>
@@ -384,6 +385,9 @@
     import { pipeline, TextStreamer, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.1/+esm";
     import { Txt2ImgWorkerClient } from "../vendor/web-txt2img/index.js";
     import {
+      KokoroTtsClient, stripMarkdownForSpeech, TTS_DEFAULT_VOICE,
+    } from "../vendor/kokoro-js/kokoro_tts_client.js";
+    import {
       validateWorldBible, validateWorldBibleSolvability, validateWorldBibleCoherence,
       autoRepairWorldBible, repairWorldBibleCoherence, deriveMonsterWeaknessItems,
       extractFirstJson, extractMapSkeleton, extractJsonFromText, scoreChainCandidate,
@@ -392,6 +396,10 @@
       snapRoomToBible, snapItemToBible, roomsMatch, mergeRoomAlias,
       normalizeItemToken, splitItemList, matchItem, matchExit,
       matchMechanicAction, matchChainStep, flagKeyFromName,
+      playerHasItem, itemPresentInRoom, itemsTakenFromLocation,
+      stripTakenItemsFromDescription,
+      formatRoomPresence, npcGiftAlreadyReceived, mechanicAlreadyApplied,
+      isRiddleSolved, markRiddleSolved, markMechanicApplied, riddleFlagKey, completedChainStepNumbers,
       computeChainProgress, simulateChainPlaythrough, reachableRoomsAtStep,
       truncateAtWordBoundary, pickSdStylePhrase,
     } from "./world_bible_logic.mjs";
@@ -406,7 +414,7 @@
     // CONFIGURATION
     // ═══════════════════════════════════════════════════════════════════════════
     /** Bump when shipping UI/engine changes — visible on load screen + header. */
-    const GAME_VERSION = "1.1.7";
+    const GAME_VERSION = "1.1.8";
 
     /** Version on load screen and in-game header — run early so it shows even if later init fails. */
     function applyGameVersionLabels() {
@@ -414,7 +422,7 @@
       const loadVer = document.getElementById("load-version");
       if (loadVer) loadVer.textContent = label;
       const gameVer = document.getElementById("game-version");
-      if (gameVer) gameVer.textContent = `Gemma 4B + SD 1.5 — all in browser | ${label}`;
+      if (gameVer) gameVer.textContent = `Gemma 4B + SD 1.5 + Kokoro TTS — all in browser | ${label}`;
     }
     applyGameVersionLabels();
 
@@ -458,6 +466,7 @@
     // SD 1.5 + Gemma on the same WebGPU device can hang forever; WASM for SD avoids that.
     const IMG_GENERATION_TIMEOUT_MS = 120000;
     const IMG_DEFER_AFTER_LLM_MS = 1500;
+    const TTS_DEFER_AFTER_LLM_MS = 1500;
     const IMAGE_THEME = "Dark fantasy cave with glowing crystals, ancient stone architecture, misty atmosphere";
 
     // SD 1.5 rules (simple model, ~77 CLIP tokens): few concrete subjects, one composition hint, no contradictions.
@@ -472,18 +481,22 @@
     // Download with: python3 -c "from huggingface_hub import snapshot_download; ..."
     // See README.md or local_models/ for details.
     const LOCAL_MODELS_BASE = "/local_models";
+    const TTS_MODEL_ID = "onnx-community/Kokoro-82M-v1.0-ONNX";
     let useLocalLlm = false;
     let useLocalImg = false;
+    let useLocalTts = false;
 
     async function detectLocalModels() {
       if (!["localhost", "127.0.0.1", "0.0.0.0"].includes(location.hostname)) return;
-      // Check LLM and SD availability independently so one can be local while the other downloads remotely
-      const [llmOk, imgOk] = await Promise.all([
+      // Check LLM, SD, and TTS availability independently
+      const [llmOk, imgOk, ttsOk] = await Promise.all([
         fetch(`${LOCAL_MODELS_BASE}/${LLM_MODEL_ID}/config.json`, { method: "HEAD" }).then(r => r.ok).catch(() => false),
-        fetch(`${LOCAL_MODELS_BASE}/microsoft/stable-diffusion-v1.5-webnn/text-encoder.onnx`, { method: "HEAD" }).then(r => r.ok).catch(() => false)
+        fetch(`${LOCAL_MODELS_BASE}/microsoft/stable-diffusion-v1.5-webnn/text-encoder.onnx`, { method: "HEAD" }).then(r => r.ok).catch(() => false),
+        fetch(`${LOCAL_MODELS_BASE}/${TTS_MODEL_ID}/config.json`, { method: "HEAD" }).then(r => r.ok).catch(() => false),
       ]);
       useLocalLlm = llmOk;
       useLocalImg = imgOk;
+      useLocalTts = ttsOk;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -777,7 +790,8 @@
 
       "RULES:\n" +
       "- Use room_take to pick up items (NOT add_items)\n" +
-      "- Check inventory before using items, check room items before room_take\n" +
+      "- Check inventory before using items, check current_room_items before room_take\n" +
+      "- Never describe items in inventory or marked already taken as still in the room\n" +
       "- Use connect when entering a NEW room\n" +
       "- ONLY move to rooms listed in current_exits or create new connected rooms\n" +
       "- Update set_context every turn\n" +
@@ -2469,8 +2483,12 @@
       const seenNotTaken = [];
       for (const k of (wb.key_items || [])) {
         if (!k || typeof k.name !== "string" || !k.name) continue;
-        if (invCanon.has(k.name)) continue;
-        if (seenInRoom.has(k.name)) seenNotTaken.push(k.name);
+        if (playerHasItem(k.name, s.inventory, wb)) continue;
+        const canon = snapItemToBible(k.name, wb);
+        const seenHere = [...seenInRoom].some(s =>
+          s === canon || matchItem(k.name, [s])
+        );
+        if (seenHere) seenNotTaken.push(k.name);
         else missing.push(k.name);
       }
       if (missing.length) out.missing_items = missing;
@@ -2525,7 +2543,9 @@
       const context = { location: loc, health: s.health };
       if (s.inventory.length) context.inventory = s.inventory;
       if (currentExits.length) context.current_exits = currentExits;
-      if (currentItems.length) context.current_room_items = currentItems;
+      context.current_room_items = currentItems;
+      const takenFromHere = itemsTakenFromLocation(loc, s, activeWorldBible);
+      if (takenFromHere.length) context.already_taken_here = takenFromHere;
       if (s.storyContext) context.story_context = s.storyContext;
       if (s.recentHistory.length) context.last_turn = s.recentHistory.slice(-1)[0];
       if (s.notes.length) context.notes = s.notes.slice(-3);
@@ -2540,16 +2560,24 @@
       const chain = activeWorldBible.puzzle_chain || [];
       if (chain.length) {
         const invCanon = new Set(s.inventory.map(i => snapItemToBible(i, activeWorldBible)));
-        const { nextStep } = computeChainProgress(chain, {
+        const { nextStep, doneCount } = computeChainProgress(chain, {
           inventoryCanonical: invCanon,
           gameFlags: s.gameFlags,
           explicitDone: s.chainStepsDone || [],
           wb: activeWorldBible,
         });
+        context.puzzle_progress = `${doneCount}/${chain.length}`;
+        const completed = completedChainStepNumbers(s, activeWorldBible);
+        if (completed.length) context.completed_chain_steps = completed;
         if (nextStep) {
           context.current_goal = { step: nextStep.step, do: nextStep.action };
         }
       }
+
+      const solvedRiddlesHere = (activeWorldBible.riddles || [])
+        .filter(r => r.location && roomsMatch(r.location, loc) && isRiddleSolved(r, s))
+        .map(r => r.hint);
+      if (solvedRiddlesHere.length) context.solved_riddles_here = solvedRiddlesHere;
 
       // Locked exits from current room (advisory — narrator may refuse)
       if (activeGating.lockedRooms && activeGating.lockedRooms.size && chain.length) {
@@ -2581,7 +2609,11 @@
       const cues = [];
       for (const locEntry of (activeWorldBible.locations || [])) {
         if (roomsMatch(locEntry.name, loc)) {
-          if (locEntry.description) cues.push(`Room: ${locEntry.description}`);
+          const takenHere = itemsTakenFromLocation(loc, s, activeWorldBible);
+          if (locEntry.description) {
+            const roomDesc = stripTakenItemsFromDescription(locEntry.description, takenHere, activeWorldBible);
+            cues.push(`Room: ${roomDesc}`);
+          }
           if (Array.isArray(locEntry.scenery) && locEntry.scenery.length) cues.push(`Scenery: ${locEntry.scenery.join(", ")}`);
           // Only inject blocked_by if the corresponding _unblocked flag has NOT been set
           const ubKey = locEntry.name.replace(/[^a-zA-Z0-9]+/g, "_") + "_unblocked";
@@ -2591,7 +2623,12 @@
       }
       for (const npc of (activeWorldBible.npcs || [])) {
         if (npc.location && roomsMatch(npc.location, loc)) {
-          cues.push(`NPC: ${npc.name} (${npc.personality}${npc.provides ? ", provides: " + npc.provides : ""})`);
+          const giftDone = npcGiftAlreadyReceived(npc, s, activeWorldBible);
+          if (giftDone) {
+            cues.push(`NPC: ${npc.name} (already helped — player has ${giftDone})`);
+          } else {
+            cues.push(`NPC: ${npc.name} (${npc.personality}${npc.provides ? ", provides: " + npc.provides : ""})`);
+          }
         }
       }
       for (const mon of (activeWorldBible.monsters || [])) {
@@ -2608,20 +2645,35 @@
       }
       for (const riddle of (activeWorldBible.riddles || [])) {
         if (riddle.location && roomsMatch(riddle.location, loc)) {
+          if (isRiddleSolved(riddle, s)) continue;
           cues.push(`Puzzle: "${riddle.hint}" -> ${riddle.reward || "reward"}`);
         }
       }
       for (const mech of (activeWorldBible.mechanics || [])) {
         if (mech.location && roomsMatch(mech.location, loc)) {
-          cues.push(`Mechanic: ${mech.action} -> ${mech.effect}`);
+          if (mechanicAlreadyApplied(mech, s, activeWorldBible)) {
+            cues.push(`Mechanic (done): ${mech.action}`);
+          } else {
+            cues.push(`Mechanic: ${mech.action} -> ${mech.effect}`);
+          }
         }
       }
-      // Items available at this location
+      // Items still on the ground — live roomItems only (static item_locations ignores takes)
+      const cuedRoomItems = new Set();
       for (const [item, locDesc] of Object.entries(activeWorldBible.item_locations || {})) {
-        if (roomsMatch(locDesc, loc) && !s.inventory.includes(item)) {
-          const info = (activeWorldBible.key_items || []).find(k => k.name === item);
-          if (info) cues.push(`Item here: ${item} (${info.purpose})`);
-        }
+        if (!roomsMatch(locDesc, loc)) continue;
+        if (playerHasItem(item, s.inventory, activeWorldBible)) continue;
+        if (!itemPresentInRoom(item, loc, s)) continue;
+        const canon = snapItemToBible(item, activeWorldBible);
+        cuedRoomItems.add(canon);
+        const info = (activeWorldBible.key_items || []).find(k => k && matchItem(item, [k.name]));
+        cues.push(`Item here: ${canon}${info?.purpose ? ` (${info.purpose})` : ""}`);
+      }
+      for (const it of currentItems) {
+        const canon = snapItemToBible(it, activeWorldBible);
+        if ([...cuedRoomItems].some(c => matchItem(c, [canon, it]))) continue;
+        cuedRoomItems.add(canon);
+        cues.push(`Item here: ${canon}`);
       }
 
       const bibleLine = cues.length ? "\nWorld:\n" + cues.map(c => `  ${c}`).join("\n") : "";
@@ -2687,27 +2739,9 @@
       return isNew;
     }
 
-    /** Room description for look/move fast-path (uses world bible when available). */
+    /** Room description for look/move fast-path (live roomItems + already-taken grounding). */
     function describeLocation(state, loc, wb) {
-      const parts = [];
-      if (wb) {
-        for (const locEntry of (wb.locations || [])) {
-          if (roomsMatch(locEntry.name, loc)) {
-            if (locEntry.description) parts.push(`**${loc}**: ${locEntry.description}`);
-            break;
-          }
-        }
-      }
-      if (!parts.length) {
-        const notes = (state.knownMap[loc] || {}).notes;
-        parts.push(notes ? `**${loc}**: ${notes}` : `You are in **${loc}**.`);
-      }
-      const roomItems = state.roomItems[loc] || [];
-      if (roomItems.length) parts.push(`You see: ${roomItems.join(", ")}.`);
-      const exits = (state.knownMap[loc] || {}).exits || [];
-      if (exits.length) parts.push(`Exits: ${exits.join(", ")}.`);
-      parts.push(`Health: ${state.health}. Carrying: ${state.inventory.length ? state.inventory.join(", ") : "nothing"}.`);
-      return parts.join(" ");
+      return formatRoomPresence(state, loc, wb);
     }
 
     /** Key items whose names appear in a mechanic action string. */
@@ -2782,6 +2816,7 @@
         }
       }
 
+      markMechanicApplied(mech, stateMgr.state);
       debug.push(`[fastpath] mechanic: ${mech.action}`);
       return mech.effect || "Something changes in the room.";
     }
@@ -2887,9 +2922,12 @@
             if (!npc.name || !npc.location || !roomsMatch(npc.location, state.location)) continue;
             if (normalizeItemToken(npc.name).includes(targetNorm) || targetNorm.includes(normalizeItemToken(npc.name))) {
               debug.push(`[fastpath] examine npc: ${npc.name}`);
+              const giftDone = npcGiftAlreadyReceived(npc, state, wb);
+              const provideLine = giftDone
+                ? ` Already helped you — you have the ${giftDone}.`
+                : (npc.provides ? ` Can provide: ${npc.provides}.` : "");
               return {
-                narrative: `**${npc.name}** — ${npc.personality || "mysterious"}.` +
-                  (npc.provides ? ` Can provide: ${npc.provides}.` : ""),
+                narrative: `**${npc.name}** — ${npc.personality || "mysterious"}.${provideLine}`,
                 debug,
               };
             }
@@ -3016,12 +3054,11 @@
         const isNew = revealRoomFromBible(stateMgr, moveTarget, wb);
         debug.push(`[fastpath] move_to: ${moveTarget}${isNew ? " (new)" : ""}`);
         const bits = [`You enter **${moveTarget}**.`];
-        const wbLoc = wb?.locations?.find(l => roomsMatch(l.name, moveTarget));
-        if (wbLoc?.description) bits.push(wbLoc.description);
-        const roomItems = state.roomItems[moveTarget] || [];
-        if (roomItems.length) bits.push(`You see: ${roomItems.join(", ")}.`);
-        const newExits = (state.knownMap[moveTarget] || {}).exits || [];
-        if (newExits.length) bits.push(`Exits: ${newExits.join(", ")}.`);
+        bits.push(...formatRoomPresence(state, moveTarget, wb, {
+          asParts: true,
+          includeHeader: false,
+          includeStatus: false,
+        }));
         return { narrative: bits.join(" "), debug, showImage: true };
       }
 
@@ -3120,6 +3157,8 @@
           if (matches.length === 1) {
             const r = matches[0];
             debug.push(`[fastpath] answer riddle: ${r.hint}`);
+            markRiddleSolved(r, stateMgr.state);
+            debug.push(`[fastpath] flag: ${riddleFlagKey(r)}=true`);
             const mechResult = tryApplyMechanic(stateMgr, r.solution, wb, debug);
             return { narrative: mechResult || r.reward || "The puzzle yields to your answer.", debug };
           }
@@ -3443,11 +3482,116 @@
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // NARRATOR TTS — Kokoro 82M WASM (CPU; lazy load when toggle on)
+    // ═══════════════════════════════════════════════════════════════════════════
+    const NARRATION_STORAGE_KEY = "jmr_adventure_narration";
+    let narrationEnabled = localStorage.getItem(NARRATION_STORAGE_KEY) === "on";
+    let ttsClient = null;
+    let ttsLoadPromise = null;
+    let ttsReady = false;
+    let ttsLastBackend = "";
+    let currentNarrationAudio = null;
+    let ttsSpeakGen = 0;
+
+    function updateNarrationButton() {
+      const btn = $("btn-narration");
+      if (!btn) return;
+      btn.textContent = narrationEnabled ? "Narration: On" : "Narration: Off";
+      btn.classList.toggle("primary", narrationEnabled);
+    }
+
+    function cancelNarration() {
+      ttsSpeakGen++;
+      if (currentNarrationAudio) {
+        currentNarrationAudio.pause();
+        currentNarrationAudio = null;
+      }
+      if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+      if (ttsClient) ttsClient.cancel();
+    }
+
+    async function ensureTtsLoaded() {
+      if (ttsReady && ttsClient) return true;
+      if (ttsLoadPromise) return ttsLoadPromise;
+      ttsLoadPromise = (async () => {
+        try {
+          await detectLocalModels();
+          if (!ttsClient) ttsClient = new KokoroTtsClient();
+          const res = await ttsClient.load({
+            useLocal: useLocalTts,
+            voice: TTS_DEFAULT_VOICE,
+            onProgress: (file) => setDebug([`TTS load${useLocalTts ? " (local)" : " (remote)"}: ${file}`]),
+          });
+          ttsReady = !!res.ok;
+          ttsLastBackend = `kokoro wasm${useLocalTts ? " local disk" : " HF+cache"}`;
+          setDebug([`TTS backend: ${ttsLastBackend}`]);
+          return ttsReady;
+        } catch (e) {
+          ttsLastBackend = `kokoro load failed: ${e.message || e}`;
+          return false;
+        } finally {
+          ttsLoadPromise = null;
+        }
+      })();
+      return ttsLoadPromise;
+    }
+
+    function speakWebSpeech(text, gen) {
+      if (typeof speechSynthesis === "undefined") return;
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate = 0.95;
+      utter.onend = () => { if (gen === ttsSpeakGen) currentNarrationAudio = null; };
+      speechSynthesis.speak(utter);
+      setDebug([`TTS fallback: Web Speech (${text.length} chars)`]);
+    }
+
+    /** Speak narrative text; defer after LLM/SD to avoid CPU/GPU contention. */
+    async function speakNarration(rawText, { defer = false } = {}) {
+      if (!narrationEnabled || !rawText) return;
+      const text = stripMarkdownForSpeech(rawText);
+      if (!text || text.startsWith("(")) return;
+
+      cancelNarration();
+      const gen = ttsSpeakGen;
+
+      if (defer && TTS_DEFER_AFTER_LLM_MS > 0) {
+        await new Promise((r) => setTimeout(r, TTS_DEFER_AFTER_LLM_MS));
+        if (gen !== ttsSpeakGen) return;
+      }
+
+      let usedFallback = false;
+      try {
+        const ok = await ensureTtsLoaded();
+        if (gen !== ttsSpeakGen) return;
+        if (!ok) throw new Error(ttsLastBackend || "Kokoro load failed");
+        const blob = await ttsClient.generate(text, TTS_DEFAULT_VOICE);
+        if (gen !== ttsSpeakGen || !blob) return;
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        currentNarrationAudio = audio;
+        audio.onended = () => {
+          URL.revokeObjectURL(url);
+          if (gen === ttsSpeakGen) currentNarrationAudio = null;
+        };
+        await audio.play();
+        setDebug([`TTS: ${ttsLastBackend}, ${text.length} chars, voice=${TTS_DEFAULT_VOICE}`]);
+      } catch (e) {
+        usedFallback = true;
+        if (gen !== ttsSpeakGen) return;
+        speakWebSpeech(text, gen);
+        setDebug([`TTS Kokoro failed → Web Speech: ${e.message || e}`]);
+      }
+      if (!usedFallback && gen === ttsSpeakGen) {
+        /* logged above */
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // UI HELPERS
     // ═══════════════════════════════════════════════════════════════════════════
     const $ = (id) => document.getElementById(id);
 
-    function appendTurn(playerCmd, narrativeText) {
+    function appendTurn(playerCmd, narrativeText, speakOpts) {
       const div = document.createElement("div");
       div.className = "turn";
       if (playerCmd) {
@@ -3462,6 +3606,7 @@
       div.appendChild(narr);
       $("narrative").appendChild(div);
       $("narrative").scrollTop = $("narrative").scrollHeight;
+      if (narrativeText) speakNarration(narrativeText, speakOpts);
     }
 
     function showThinking() {
@@ -3751,7 +3896,7 @@
         stateMgr.moveTo(wb.locations?.[0]?.name || "Entrance");
       }
 
-      appendTurn(null, narrative || "Your journey begins…");
+      appendTurn(null, narrative || "Your journey begins…", { defer: true });
       updateStatusPanel(stateMgr);
       const seedInfo = `seeded: ${Object.keys(stateMgr.state.knownMap).length} rooms, ${Object.values(stateMgr.state.roomItems).flat().length} items placed`;
       setDebug([...debugHeader, ...debug, seedInfo]);
@@ -3762,6 +3907,7 @@
 
     async function handleTurn(playerInput) {
       if (!playerInput.trim()) return;
+      cancelNarration();
 
       // Fast-path: deterministic commands skip LLM entirely (~60% of typical inputs)
       const local = tryLocalCommand(stateMgr, playerInput, activeWorldBible);
@@ -3816,7 +3962,7 @@
         stateMgr.state.recentHistory[stateMgr.state.recentHistory.length - 1].response = (narrative || "").slice(0, 200);
       }
 
-      appendTurn(playerInput, narrative || "(The narrator says nothing.)");
+      appendTurn(playerInput, narrative || "(The narrator says nothing.)", { defer: true });
       updateStatusPanel(stateMgr);
       setDebug([...debugHeader, ...debug, cueSummary]);
 
@@ -3907,8 +4053,11 @@
       const wb = activeWorldBible;
       const wbLoc = (wb.locations || []).find((l) => l.name === room);
       const items = (stateMgr.state.roomItems[room] || []).slice(0, 2);
-      const npcRow = (wb.npcs || []).filter((n) => n.location === room).slice(0, 1);
-      const monRow = (wb.monsters || []).filter((m) => m.location === room).slice(0, 1);
+      const npcRow = (wb.npcs || []).filter((n) => n.location && roomsMatch(n.location, room)).slice(0, 1);
+      const monRow = (wb.monsters || []).filter((m) => {
+        if (!m.location || !roomsMatch(m.location, room)) return false;
+        return !stateMgr.state.gameFlags[flagKeyFromName(m.name, "_defeated")];
+      }).slice(0, 1);
       const sceneryOne = (wbLoc?.scenery || []).slice(0, 1);
 
       const keyParts = [];
@@ -4076,6 +4225,20 @@
       }
     }
     refreshSavedList();
+    updateNarrationButton();
+
+    // ── Narration toggle (Kokoro TTS; lazy load on first speak) ──
+    $("btn-narration").addEventListener("click", async () => {
+      narrationEnabled = !narrationEnabled;
+      localStorage.setItem(NARRATION_STORAGE_KEY, narrationEnabled ? "on" : "off");
+      updateNarrationButton();
+      if (!narrationEnabled) {
+        cancelNarration();
+        setDebug(["TTS: narration off"]);
+      } else {
+        setDebug(["TTS: narration on (loads Kokoro WASM on first line)"]);
+      }
+    });
 
     // ── Import file picker ──
     $("import-file").addEventListener("change", (e) => {
@@ -4172,8 +4335,12 @@
 
       // Detect which models have local files (localhost only; each checked independently)
       await detectLocalModels();
-      if (useLocalLlm || useLocalImg) {
-        const parts = [useLocalLlm ? "LLM" : null, useLocalImg ? "SD 1.5" : null].filter(Boolean).join(" + ");
+      if (useLocalLlm || useLocalImg || useLocalTts) {
+        const parts = [
+          useLocalLlm ? "LLM" : null,
+          useLocalImg ? "SD 1.5" : null,
+          useLocalTts ? "Kokoro TTS" : null,
+        ].filter(Boolean).join(" + ");
         setLoad({ text: `Local model files detected (${parts}) — loading from disk where available.` });
       }
 

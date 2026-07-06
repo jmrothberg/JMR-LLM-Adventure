@@ -21,6 +21,18 @@ import {
   normalizeItemToken,
   splitItemList,
   matchItem,
+  playerHasItem,
+  itemPresentInRoom,
+  itemsTakenFromLocation,
+  stripTakenItemsFromDescription,
+  formatRoomPresence,
+  npcGiftAlreadyReceived,
+  mechanicAlreadyApplied,
+  isRiddleSolved,
+  markRiddleSolved,
+  markMechanicApplied,
+  riddleFlagKey,
+  mechanicFlagKey,
   matchExit,
   matchMechanicAction,
   matchChainStep,
@@ -283,6 +295,103 @@ export async function runWorldBibleTests(opts = {}) {
     assert(matchItem("staff", items) === "wizards_staff");
     assert(matchItem("lantern", items) === "elven_lantern");
     return "partial token containment works";
+  }));
+
+  regression.push(runCase("itemsTakenFromLocation after take", () => {
+    const wb = {
+      locations: [{ name: "Mushroom Grotto", items: ["flint"] }],
+      item_locations: { flint: "Mushroom Grotto" },
+      key_items: [{ name: "flint", purpose: "spark" }],
+    };
+    const state = {
+      location: "Mushroom Grotto",
+      inventory: ["flint"],
+      roomItems: { "Mushroom Grotto": [] },
+    };
+    const taken = itemsTakenFromLocation("Mushroom Grotto", state, wb);
+    assert(taken.includes("flint"));
+    assert(!itemPresentInRoom("flint", "Mushroom Grotto", state));
+    assert(playerHasItem("flint", state.inventory, wb));
+    return "taken items excluded from room presence";
+  }));
+
+  regression.push(runCase("formatRoomPresence strips taken item from description", () => {
+    const wb = {
+      locations: [{
+        name: "Mushroom Grotto",
+        description: "A damp cavern with mushrooms. A piece of flint glints on the ground near a dead campfire.",
+        items: ["flint"],
+      }],
+      item_locations: { flint: "Mushroom Grotto" },
+      key_items: [{ name: "flint", purpose: "spark" }],
+    };
+    const state = {
+      location: "Mushroom Grotto",
+      health: 80,
+      inventory: ["flint"],
+      roomItems: { "Mushroom Grotto": [] },
+      knownMap: { "Mushroom Grotto": { exits: ["Cave Mouth"], notes: "" } },
+    };
+    const text = formatRoomPresence(state, "Mushroom Grotto", wb, { markdown: false });
+    assert(text.includes("mushrooms"));
+    assert(!/flint glints/i.test(text));
+    assert(!text.includes("Already taken"));
+    assert(!text.includes("You see:"));
+    assert(text.includes("Carrying: flint"));
+    return "formatRoomPresence removes stale item prose";
+  }));
+
+  regression.push(runCase("stripTakenItemsFromDescription multi-sentence", () => {
+    const desc = "A damp cavern lit by mushrooms. Ancient carvings depict a forge. A piece of flint glints on the ground.";
+    const out = stripTakenItemsFromDescription(desc, ["flint"], { key_items: [{ name: "flint" }] });
+    assert(out.includes("mushrooms"));
+    assert(out.includes("carvings"));
+    assert(!/flint/i.test(out));
+    return "stripTakenItemsFromDescription drops stale sentences";
+  }));
+
+  regression.push(runCase("npcGiftAlreadyReceived after torch", () => {
+    const wb = {
+      key_items: [{ name: "torch", purpose: "light" }],
+      puzzle_chain: [{ step: 1, action: "talk to hermit", gives: "torch", unlocks: null }],
+      npcs: [{ name: "Old Hermit", location: "Cave Mouth", provides: "gives torch freely" }],
+    };
+    const state = { inventory: ["torch"], gameFlags: {}, chainStepsDone: [] };
+    const gift = npcGiftAlreadyReceived(wb.npcs[0], state, wb);
+    assert(gift === "torch");
+    const empty = npcGiftAlreadyReceived(wb.npcs[0], { inventory: [], gameFlags: {}, chainStepsDone: [] }, wb);
+    assert(empty === null);
+    return "NPC gift detected when player holds chain item";
+  }));
+
+  regression.push(runCase("riddle solved flag suppresses re-cue", () => {
+    const riddle = {
+      location: "Ancient Forge",
+      hint: "FIRE AWAKENS WHAT STONE REMEMBERS",
+      solution: "use flint on forge",
+      reward: "forge ignites",
+    };
+    const state = { gameFlags: {} };
+    assert(!isRiddleSolved(riddle, state));
+    markRiddleSolved(riddle, state);
+    assert(isRiddleSolved(riddle, state));
+    assert(state.gameFlags[riddleFlagKey(riddle)] === true);
+    return "riddle flag set and checked";
+  }));
+
+  regression.push(runCase("mechanicAlreadyApplied after forge step", () => {
+    const wb = {
+      puzzle_chain: [{ step: 6, action: "use flint on forge", gives: "enchanted blade", location: "Ancient Forge" }],
+      mechanics: [{ action: "use flint on forge or light forge", effect: "forge ignites", location: "Ancient Forge" }],
+    };
+    const mech = wb.mechanics[0];
+    const stateBefore = { inventory: ["flint"], gameFlags: {}, chainStepsDone: [] };
+    assert(!mechanicAlreadyApplied(mech, stateBefore, wb));
+    const stateAfter = { inventory: ["flint", "enchanted blade"], gameFlags: {}, chainStepsDone: [] };
+    assert(mechanicAlreadyApplied(mech, stateAfter, wb));
+    const stateFlag = { inventory: ["flint"], gameFlags: { [mechanicFlagKey(mech)]: true }, chainStepsDone: [] };
+    assert(mechanicAlreadyApplied(mech, stateFlag, wb));
+    return "mechanic done via chain gives or _done flag";
   }));
 
   regression.push(runCase("matchExit cardinals and substring", () => {
