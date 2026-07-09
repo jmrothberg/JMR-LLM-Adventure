@@ -420,7 +420,7 @@ async function getTokenizer() {
     let env = null;
     // LLM: Module workers often lack import maps — bare @xenova/@huggingface specifiers fail on localhost.
     const XENOVA_TRANSFORMERS_ESM = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/+esm';
-    const HF_TRANSFORMERS_ESM = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.1/+esm';
+    const HF_TRANSFORMERS_ESM = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/+esm';
     try {
         const mod = await import(/* webpackIgnore: true */ XENOVA_TRANSFORMERS_ESM);
         AutoTokenizerMod = mod.AutoTokenizer;

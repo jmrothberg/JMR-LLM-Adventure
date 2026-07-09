@@ -522,7 +522,7 @@ async function getTokenizer() {
     let AutoTokenizerMod = null;
     let env = null;
     const XENOVA_ESM = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/+esm';
-    const HF_ESM = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.1/+esm';
+    const HF_ESM = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/+esm';
     try {
         const mod = await import(/* webpackIgnore: true */ XENOVA_ESM);
         AutoTokenizerMod = mod.AutoTokenizer; env = mod.env;

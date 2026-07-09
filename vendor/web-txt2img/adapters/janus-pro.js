@@ -20,7 +20,7 @@ export class JanusProAdapter {
         // Dynamic import of Transformers.js (optional peer). Error clearly if missing.
         let hf = null;
         // LLM: Document import maps often do NOT apply inside module workers — bare @huggingface/transformers fails on localhost. Absolute +esm URL works (CORS).
-        const HF_TRANSFORMERS_ESM = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.1/+esm';
+        const HF_TRANSFORMERS_ESM = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0/+esm';
         try {
             hf = await import(/* webpackIgnore: true */ HF_TRANSFORMERS_ESM).catch(() => null);
         }
